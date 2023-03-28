@@ -1,0 +1,729 @@
+#!/usr/bin/env groovy
+@Library('docker') _
+
+def BUILD_EXECUTOR = "none"
+def COMMIT_TO_BUILD
+def REPO_TO_BUILD
+def IN_DOCKER_BUILD_IMAGE
+def props
+def NEXUS_RAW_REPOSITORY = 'https://nexus.devops.broadridge.net/repository/WSTN-TEST-DEV'
+def NEXUS_DOCKER_REPOSITORY = 'nexus.devops.broadridge.net:7000'
+def NEXUS_ID = 'agg_nexus_id'
+def SONAR_SERVER_URL = 'https://devops.sonarq.dev.npd.bfsaws.net'
+def SONAR_PROJECT_TOKEN = 'agg-sonar'
+def SONAR_PROJECT_NAME
+def SONAR_PROJECT_KEY = 'GTO_AGGR-SERVICES_1979'
+def SONAR_REPORT_FILE
+def PERMANENT_STORE="/mnt/efs/permanent/"
+def GIT_HASH_LONG
+def GIT_HASH
+def CHECK_STATE="failed"
+def BUILD_STATE="0"
+def SPRINT_NUMBER
+def NOTIFICATION_HUB="0"
+def IS_RELEASE = false
+// Moved to Jenkins folder
+// def MCR = "8"
+def BUILD_AT
+def ALREADY_SUCCESS = false
+def AGENT_LABEL = "agg-wstn-agent-1"
+def MVN_BUILD_COMMAND = "package"
+def GIT_READ_KEY = "git_read_key"
+
+//def GITLAB_API_TOKEN='wstn-agg_git_api_token'
+def GITLAB_API_TOKEN='wstn-agg_git_api_token_new'
+def TARGET_DOCKER=false
+def IS_DOCKER=false // true if the docker build process enabled
+def IS_SONAR=true
+def IS_SONAR_QG=true
+def IS_UPLOAD=false
+def IS_PROMOTE=false
+
+
+def SDLC
+def ACCOUNT_ENV
+def ENV_ALIAS
+
+def REPO_PATH
+def GITLAB_ID
+
+def ENV_TO_DEPLOY = []
+
+properties([
+    buildDiscarder(
+        logRotator(
+            artifactDaysToKeepStr: '60', 
+            artifactNumToKeepStr: '1', 
+            daysToKeepStr: '30', 
+            numToKeepStr: '20'
+        )
+    )
+])
+
+pipeline()
+{
+    agent none
+    parameters
+    {
+        string(name: 'GIT_REPO', defaultValue: '', description: 'GIT repository name with path')
+        string(name: 'COMMIT_ID', defaultValue: '', description: 'GIT Branch, Tag or full commit hash')
+        booleanParam(name: 'SONAR_CHECK_GATE', defaultValue: true, description: 'Designate if the build should fail on a failed Sonar report')
+        booleanParam(name: 'DEPLOY', defaultValue: true)
+        booleanParam(name: 'PROMOTE', defaultValue: true)
+
+        booleanParam(name: 'ENFORCE_DOCKER', defaultValue: false)
+        booleanParam(name: 'ENFORCE_UPLOAD', defaultValue: false)
+//        booleanParam(name: 'ENFORCE_PROMOTE' defaultValue: false, description: 'Enforcing promotion of the artifact. Also enforcing Docker build and Nexus upload')
+    }    
+    environment 
+    {
+        HOME='.'
+    }
+    options
+    {
+        timeout(time: 90, unit: 'MINUTES')
+    }
+    stages
+    {
+        stage('On Node Cleanup')
+        {
+            agent
+            {
+                label AGENT_LABEL
+            }
+            stages()
+            {
+                stage('Checkout')
+                {
+                    steps
+                    {
+                        // collect parameters before checkout
+                        cleanWs()
+                        script
+                        {
+                            // debug
+                            sh 'printenv'
+                            // Git Repo to build
+                            REPO_TO_BUILD = params.GIT_REPO == "" ? env.gitlabSourceRepoURL : GitLabGitUrlByName(params.GIT_REPO)
+                            REPO_PATH = params.GIT_REPO == "" ? env.gitlabSourceNamespace + "/" + env.gitlabSourceRepoName : params.GIT_REPO
+                            GITLAB_ID = GitLabGetIdByName(REPO_PATH, GITLAB_API_TOKEN)
+                            println "GITLAB ID: " + GITLAB_ID
+                            // Commit ID/Branch/Tag to build
+                            COMMIT_TO_BUILD = params.COMMIT_ID == "" ? "origin/" + env.gitlabBranch : (params.COMMIT_ID.startsWith("origin/") ? params.COMMIT_ID : "origin/" + params.COMMIT_ID)
+
+                            // println "GIT HASH: " + GitLabGetHashFromRef(GITLAB_ID, COMMIT_TO_BUILD, GITLAB_API_TOKEN)
+
+                            // println "Docker result: " + GitLabCheckSingleFile(GITLAB_ID, COMMIT_TO_BUILD, GITLAB_API_TOKEN, 'Dockerfile')
+
+                        }
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: COMMIT_TO_BUILD]],
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'src']],
+                            submoduleCfg: [],
+                            userRemoteConfigs: [[credentialsId: GIT_READ_KEY, url: REPO_TO_BUILD]]
+                        ])
+                    }
+                }
+                stage('Setup')
+                {
+                    steps
+                    {
+                        script
+                        {
+                            // Git information
+                            GIT_HASH_LONG = sh (script: "cd src && git rev-parse HEAD && cd ..", returnStdout: true).trim()
+                            GIT_HASH = GIT_HASH_LONG.substring(0,8)  
+                            // Read properties from the git repository
+                            props = readProperties file: 'src/build.props'
+                            // Report to the gitlab that the build is running
+                            // setPipelineState(GITLAB_ID, GITLAB_API_TOKEN, GIT_HASH_LONG, "running")
+                            // Setup Sonar Url
+                            env.SONAR_SERVER_URL = SONAR_SERVER_URL
+                            // Collect information for version (except MCR)
+                            // The version: <MCR>.<SPRINT>.<JENKINS BUILD ID>
+                            def strDate = sh(
+                                script: '''
+                                    NOW=$(date +"%Y-%m-%d")
+                                    BUILD_AT=$(date +"%Y-%m-%d %H:%M")
+                                    START="2019-01-21"
+                                    daysSinceStart=$(( (`date -d $NOW +%s` - `date -d $START +%s`) / (24*3600) ))
+                                    sprint=$(( (`date -d $NOW +%s` - `date -d $START +%s`) / (24*3600*14) ))
+                                    dayOfSprint=$(( daysSinceStart - ((daysSinceStart / 14) * 14) ))
+                                    dayOfSprint=$((dayOfSprint+1))
+                                    sprint=$((sprint+1))
+                                    echo "$sprint $dayOfSprint $BUILD_AT"
+                                ''',
+                                returnStdout: true
+                            )
+                            def arrDate = strDate.split()
+                            SPRINT_NUMBER = arrDate[0]
+                            env.build_sprintNumber = arrDate[0]
+                            BUILD_AT = arrDate[2] + " " + arrDate[3]
+                            env.build_number = env.BUILD_ID
+                            env.MCR = MCR
+
+                            TARGET_DOCKER = fileExists 'src/Dockerfile'
+                            sh "ls -p ${PERMANENT_STORE}environments/ | egrep -v /\$ > envlist"
+                            def envlist = readFile("envlist").split("\\r?\\n")
+
+                            def envprops
+                            envlist.each
+                            {
+                                envprops = readProperties file: "${PERMANENT_STORE}environments/$it"
+                                // split the name to SDLC and Alias
+                                envnames = "$it".split("_")
+                                SDLC = envnames[0]
+                                ENV_ALIAS =  envnames.length > 1 ? ENV_ALIAS = envnames[1] : ""
+                                // figure out the environment type npd/prd
+                                switch(SDLC)
+                                {
+                                    case "sbx":
+                                        ACCOUNT_ENV="npd"
+                                        break
+                                    case "dev":
+                                        ACCOUNT_ENV="npd"
+                                        break
+                                    case "int":
+                                        ACCOUNT_ENV="npd"
+                                        break
+                                    case "qa":
+                                        ACCOUNT_ENV="prd"
+                                        break
+                                    case "uat":
+                                        ACCOUNT_ENV="prd"
+                                        break
+                                    case "prd":
+                                        ACCOUNT_ENV="prd"
+                                        break
+                                }
+                                
+                                // if the current branch what we are building is on any environment's deploy list, it should be uploaded to the Nexus
+                                if(("origin/" + envprops[props.PROJECT_NAME]) == COMMIT_TO_BUILD)
+                                {
+                                    IS_UPLOAD = true
+                                    IS_DOCKER = TARGET_DOCKER
+                                    IS_PROMOTE = ACCOUNT_ENV == "prd"
+                                    if(envprops._autodeploy == "1")
+                                    {
+                                        ENV_TO_DEPLOY.add("$it")
+                                    }
+                                }
+                            }
+                            // Certain artifacts not deployed to the environments, for those artifact the master and prod upload is absolutelly necessary
+                            /*
+                            if(COMMIT_TO_BUILD == "origin/master" || COMMIT_TO_BUILD == "origin/prod")
+                            {
+                                IS_UPLOAD = true
+                            }
+                            */
+                            // Additional build parameters
+                            if(props.NOTIFICATION_HUB != null)
+                            {
+                                NOTIFICATION_HUB = props.NOTIFICATION_HUB ? "1" : "0"
+                            }
+                            if(props.MVN_BUILD_COMMAND != null)
+                            {
+                                MVN_BUILD_COMMAND = props.MVN_BUILD_COMMAND
+                            }
+                            // Decide the executor
+                            IN_DOCKER_BUILD_IMAGE = 'nexus.devops.broadridge.net:7000/wstn/buildtool:latest'
+                            def exists = fileExists 'src/pom.xml'
+                            if(exists)
+                            {
+                                BUILD_EXECUTOR = 'mvn'
+                                IN_DOCKER_BUILD_IMAGE = 'nexus.devops.broadridge.net:9090/library/maven:3-jdk-11'
+                            }
+                            exists = fileExists 'src/build.gradle'
+                            if(exists)
+                            {
+                                BUILD_EXECUTOR = 'gradle'
+                                IN_DOCKER_BUILD_IMAGE = 'nexus.devops.broadridge.net:9090/library/gradle:5.4.1-jdk11'
+                            }
+                            exists = fileExists 'src/package.json'
+                            if(exists)
+                            {
+                                BUILD_EXECUTOR = 'npm'
+                                IN_DOCKER_BUILD_IMAGE = 'nexus.devops.broadridge.net:7000/wstn/npm:latest'
+                                /*
+                                    docker
+                                    {
+                                        label AGENT_LABEL
+                                        image 'wstn/npm:latest'
+                                        registryUrl 'https://nexus.devops.broadridge.net:7000'
+                                        registryCredentialsId params.NEXUS_ID
+                                    }
+                                */
+                            }
+                            // Override default build image
+                            if(props.DOCKER_BUILD_IMAGE != null)
+                            {
+                                IN_DOCKER_BUILD_IMAGE = props.DOCKER_BUILD_IMAGE
+                            }
+
+                            // Threat master and prod builds differently
+                            switch(COMMIT_TO_BUILD)
+                            {
+                                case "origin/prod":
+                                    IS_RELEASE = true
+                                    IS_UPLOAD = true
+                                break
+                                case "origin/master":
+                                    IS_RELEASE = true
+                                    IS_UPLOAD = true
+                                break
+                               /* case "origin/AL-108-SPRINT":
+                                    IS_RELEASE = true
+                                    IS_UPLOAD = true
+                                break */
+                            }
+                            // Setup Sonar
+                            if(IS_RELEASE)
+                            {
+                                SONAR_PROJECT_NAME = props.SONAR_PROJECT_NAME
+                                SONAR_PROJECT_KEY = props.SONAR_PROJECT_KEY
+                            }
+                            else
+                            {
+                                SONAR_PROJECT_NAME = props.TEST_SONAR_PROJECT_NAME
+                                SONAR_PROJECT_KEY = props.TEST_SONAR_PROJECT_KEY
+                            }             
+                            IS_SONAR = SONAR_PROJECT_NAME != null &&  SONAR_PROJECT_KEY != null
+                            // Setup overrides
+                            IS_SONAR_QG = IS_SONAR && params.SONAR_CHECK_GATE
+                            if(params.ENFORCE_DOCKER || params.ENFORCE_UPLOAD)
+                            {
+                                IS_DOCKER = TARGET_DOCKER
+                            }
+                            if(params.ENFORCE_UPLOAD)
+                            {
+                                IS_UPLOAD = true
+                            }
+
+                            println "BUILD_EXECUTOR: ${BUILD_EXECUTOR}"
+                            println "BUILD_DOCKER: ${IS_DOCKER}"  
+                        }
+                    }
+                }
+                stage('Save Persistent')
+                {
+                    steps
+                    {
+                        script
+                        {
+                            // check if the build file with the current git hash already exists
+                            def build_exists = fileExists "${PERMANENT_STORE}builds/${props.PROJECT_NAME}/${GIT_HASH_LONG}.build"
+                            // load it
+                            def prev_build
+                            if(build_exists)
+                            {
+                                prev_build = readProperties file: "${PERMANENT_STORE}builds/${props.PROJECT_NAME}/${GIT_HASH_LONG}.build"
+                                // check if it was successfull
+                                if(prev_build.BUILD_STATE == "1")
+                                {
+                                    ALREADY_SUCCESS = true
+                                }
+                            }
+                            // if yes, don't save anything
+                            if(!ALREADY_SUCCESS)
+                            {
+                                sh """
+                                    mkdir -p ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp
+                                    echo "VERSION=${MCR}.${SPRINT_NUMBER}.${BUILD_ID}" > ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                    echo "BUILD_ID=\$BUILD_ID" >> ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                    echo "BUILD_AT=${BUILD_AT}" >> ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                    echo "BUILD_URL=\$BUILD_URL" >> ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                    echo "COMMIT_TO_BUILD=${COMMIT_TO_BUILD}" >> ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                """
+                            }
+                        }
+                    }
+                }
+                stage('In Docker')
+                {
+                    agent
+                    {
+                        docker
+                        {
+                            image IN_DOCKER_BUILD_IMAGE
+                            label AGENT_LABEL
+                        }
+                    }
+                    stages
+                    {
+                        stage("In Docker Checkout")
+                        {
+                            steps
+                            {
+                                checkout([
+                                    $class: 'GitSCM',
+                                    branches: [[name: "origin/master"]],
+                                    // branches: [[name: "origin/AL-108-SPRINT"]],
+                                    doGenerateSubmoduleConfigurations: false,
+                                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'src']],
+                                    submoduleCfg: [],
+                                    userRemoteConfigs: [[credentialsId: GIT_READ_KEY, url: REPO_TO_BUILD]]
+                                ])
+                            }
+                        }
+                        stage('pre_build'){
+                            steps {
+                                script {
+                                    withCredentials([usernamePassword(credentialsId: NEXUS_ID, passwordVariable: 'NEXUS_PASSWORD', usernameVariable: 'NEXUS_USER')]) 
+                                    {
+                                        sh """
+                                            mkdir -p ${env.workspace}/src/?/.m2/repository/com/ibm/dhbcore/2.6.1/
+                                            curl -L -k -u ${NEXUS_USER}:${NEXUS_PASSWORD} -X GET ${NEXUS_SERVER_URL}/repository/WSTN-TEST-DEV/dhbcore-2.6.1.jar --output ${env.workspace}/src/?/.m2/repository/com/ibm/dhbcore/2.6.1/dhbcore-2.6.1.jar
+                                            curl -L -k -u ${NEXUS_USER}:${NEXUS_PASSWORD} -X GET ${NEXUS_SERVER_URL}/repository/WSTN-TEST-DEV/dhbcore-2.6.1.pom --output ${env.workspace}/src/?/.m2/repository/com/ibm/dhbcore/2.6.1/dhbcore-2.6.1.pom
+                                            curl -L -k -u ${NEXUS_USER}:${NEXUS_PASSWORD} -X GET ${NEXUS_SERVER_URL}/repository/WSTN-TEST-DEV/java-1.8.0-amazon-corretto-devel-1.8.0_242.b08-1.x86_64.rpm --output src/aggr-formatter-service/java-1.8.0-amazon-corretto-devel-1.8.0_242.b08-1.x86_64.rpm
+                                            curl -L -k -u ${NEXUS_USER}:${NEXUS_PASSWORD} -X GET ${NEXUS_SERVER_URL}/repository/WSTN-TEST-DEV/CLIENTSEARCH-ARTIFACTS/config/0.0.1-SNAPSHOT/config-0.0.1-SNAPSHOT.jar --output src/aggr-formatter-service/config-0.0.1-SNAPSHOT.jar
+                                            curl -L -k -u ${NEXUS_USER}:${NEXUS_PASSWORD} -X GET ${NEXUS_SERVER_URL}/repository/WSTN-TEST-DEV/CLIENTSEARCH-ARTIFACTS/config/0.0.1-SNAPSHOT/config-0.0.1-SNAPSHOT.jar --output src/aggr-carma-realtime-service/config-0.0.1-SNAPSHOT.jar
+                                            jar -xvf ${env.workspace}/src/aggr-formatter-service/config-0.0.1-SNAPSHOT.jar ./
+                                            jar -xvf ${env.workspace}/src/aggr-carma-realtime-service/config-0.0.1-SNAPSHOT.jar ./
+                                            cp -R ./config ${env.workspace}/src/aggr-formatter-service/
+                                            cp -R ./config ${env.workspace}/src/aggr-carma-realtime-service/
+                                        """
+                                    }
+                                }
+                            }
+                        }
+                        stage("Build")
+                        {
+                            steps
+                            {
+                                script
+                                {
+                                    switch(BUILD_EXECUTOR)
+                                    {
+                                        case "mvn":
+                                            withCredentials([usernamePassword(credentialsId: NEXUS_ID, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+                                            {
+                                                configFileProvider([configFile(fileId: '8dcc21a7-cfce-4967-8a94-ed6113f0e24b', variable: 'agg_maven_settings')])
+                                                {
+                                                    sh """
+                                                    echo "MAVEN Build"
+                                                    pwd
+                                                    cd src
+                                                    mvn -s ${agg_maven_settings} clean ${MVN_BUILD_COMMAND} -Dinternal.repo.usr=${USERNAME} -Dinternal.repo.pwd=${PASSWORD} -DskipTests=true
+                                                    cd ..
+                                                    """
+                                                }
+                                            }
+                                            break
+                                        case "npm":
+                                            withCredentials([string(credentialsId: SONAR_PROJECT_TOKEN, variable: 'TOKEN')])
+                                            {
+                                                sh """
+                                                pwd
+                                                cd src
+                                                export PATH=~/.nvm/versions/node/v10.15.1/bin:\$PATH
+                                                export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+                                                export ENABLE_AUTH_TOKEN=true
+                                                npm install
+                                                npm test
+                                                npm run build
+                                                """
+                                            }
+                                            break
+                                        case "gradle":
+                                            withCredentials([string(credentialsId: SONAR_PROJECT_TOKEN, variable: 'TOKEN')])
+                                            {
+                                                sh """
+                                                    pwd
+                                                    cd src
+                                                    mkdir -p ./.sonar
+                                                    gradle  -DMCR=${MCR} \
+                                                            -Dbuild.sprintNumber=${SPRINT_NUMBER} \
+                                                            -Dbuild.number=\$BUILD_ID \
+                                                            -Dsonar.userHome=`pwd`/.sonar \
+                                                            -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                                            -Dsonar.projectName=${SONAR_PROJECT_NAME} \
+                                                            -Dsonar.host.url=${SONAR_SERVER_URL} \
+                                                            -Dsonar.login=${TOKEN} \
+                                                            clean check bootJar sonarqube
+                                                    cd ..
+                                                """
+                                            }
+                                            junit allowEmptyResults: true, keepLongStdio: true, testResults: '**/test/*.xml'
+                                            env.SONAR_REPORT_FILE = './build/sonar/report-task.txt'
+                                        default:
+                                            // No build executor found
+                                            if(props.OVERRIDE_PERMISSIONS != null)
+                                            {
+                                                sh """
+                                                    pwd
+                                                    cd src
+                                                    find . -type f  -not -path '*/\\.*' -print0 | xargs -0 chmod ${props.OVERRIDE_PERMISSIONS}
+                                                    cd ..
+                                                """
+                                            }
+                                            switch(props.NEXUS_RAW_IMAGE_EXTENSION)
+                                            {
+                                                case "tar":
+                                                    // Just tar everything together
+                                                    sh """
+                                                        pwd
+                                                        cd src
+                                                        rm build.props
+                                                        rm README.md
+                                                        test ! -d ./target && mkdir ./target
+                                                        tar cvf ${props.BUILD_ARTIFACT_NAME} --exclude="./target" --exclude="./?" ./*
+                                                        cd ..
+                                                    """
+                                                    break
+                                                case "zip":
+                                                    // Just tar everything together
+                                                    sh """
+                                                        pwd
+                                                        cd src
+                                                        rm build.props
+                                                        rm README.md
+                                                        test ! -d ./target && mkdir ./target
+                                                        zip -r ${props.BUILD_ARTIFACT_NAME} * -x "./target/*" "./?/*"
+                                                        cd ..
+                                                    """
+                                                    break
+                                            }
+                                            break
+                                    }
+                                    if(!IS_SONAR_QG) 
+                                    {
+                                        CHECK_STATE="success"
+                                    }
+
+                                }
+                            }
+                        }
+                        stage("Sonar")
+                        {
+                            when
+                            {
+                                expression {return IS_SONAR}
+                            }
+                            steps
+                            {
+                                script
+                                {
+                                    switch(BUILD_EXECUTOR)
+                                    {
+                                        case "mvn":
+                                            configFileProvider([configFile(fileId: '8dcc21a7-cfce-4967-8a94-ed6113f0e24b', variable: 'agg_maven_settings')])
+                                            // configFileProvider([configFile(fileId: '8715a567-9159-4702-abf4-53b8b1f84c63', variable: 'agg_maven_settings')]) 
+                                            {
+                                                //withCredentials([string(credentialsId: SONAR_PROJECT_TOKEN, variable: 'TOKEN')])
+                                                withSonarQubeEnv("Enterprise_SonarQube_Staging")
+                                                {
+                                                    sh """
+                                                        pwd
+                                                        cd src
+                                                        mvn -s ${agg_maven_settings} sonar:sonar \
+                                                        -Dsonar.host.url=${SONAR_SERVER_URL} \
+                                                        -Dsonar.projectName=${SONAR_PROJECT_NAME} \
+                                                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                                        -Dsonar.login=a7bca7590f71a86d81e751ba0f6c0187af7f94de \
+                                                        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.exec
+                                                        cd ..
+                                                    """
+                                                    env.SONAR_REPORT_FILE = './target/sonar/report-task.txt'
+                                                }
+                                            }
+                                            break
+                                        case "npm":
+                                            withCredentials([string(credentialsId: SONAR_PROJECT_TOKEN, variable: 'TOKEN')])
+                                            {
+                                                sh """
+                                                pwd
+                                                cd src
+                                                sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.projectName=${SONAR_PROJECT_NAME} -Dsonar.host.url=${SONAR_SERVER_URL} -Dsonar.login=${TOKEN}
+                                                cd ..
+                                                """
+                                                env.SONAR_REPORT_FILE = './.scannerwork/report-task.txt'
+                                            }
+                                            break
+                                    }
+                                }
+                            }
+                        }
+                        stage('Check Sonar Quality Gate')
+                        {
+                            when
+                            {
+                                expression {return IS_SONAR_QG}
+                            }
+                            steps
+                            {
+                                withCredentials([string(credentialsId: SONAR_PROJECT_TOKEN, variable: 'TOKEN')])
+                                {
+                                    sh '''
+                                        cd src
+                                        pwd
+                                        # Sourcing parameters from report file to get exact taskid
+                                        . $SONAR_REPORT_FILE
+
+                                        STATUS=PENDING
+                                        while [ \\\"$STATUS\\\" = \\\"PENDING\\\" ]
+                                        do
+                                            sleep 10
+                                            RESPONSE=`curl -s -u $TOKEN: $SONAR_SERVER_URL/api/ce/task?id=$ceTaskId`
+                                            STATUS=`echo $RESPONSE | grep -o \\\"status\\\":\\\"[^\\\"]* | grep -o [^\\\"]*$`
+                                            if [ \\\"$STATUS\\\" = \\\"IN_PROGRESS\\\" ]
+                                            then
+                                                STATUS="PENDING"
+                                            fi
+                                        done
+
+                                        ANALYSISID=`echo $RESPONSE | grep -o \\\"analysisId\\\":\\\"[^\\\"]* | grep -o [^\\\"]*$`
+                                        echo $ANALYSISID
+                                        
+                                        RESPONSE=`curl -s -u $TOKEN: $SONAR_SERVER_URL/api/qualitygates/project_status?analysisId=$ANALYSISID`
+                                        QGSTATUS=`echo $RESPONSE | grep -o -m 1 \\\"status\\\":\\\"[^\\\"]* | head -1 | grep -o [^\\\"]*$`
+                                        
+                                        echo "Quality gate status:$QGSTATUS"
+                                        if [ \\\"$QGSTATUS\\\" = \\\"OK\\\" ]
+                                        then
+                                        exit 0
+                                        else
+                                        exit 1
+                                        fi
+                                        cd ..
+                                    '''
+                                }
+                            }
+                            post
+                            {
+                                success
+                                {
+                                    script
+                                    {
+                                        CHECK_STATE="success"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+        
+                stage('On Node')
+                {
+                    agent
+                    {
+                        label AGENT_LABEL
+                    }
+
+                    stages
+                    {
+                        stage("On Node Checkout")
+                        {
+                            steps
+                            {
+                                checkout([
+                                    $class: 'GitSCM',
+                                    branches: [[name: "*/master"]],
+                                    //branches: [[name: "*/AL-108-SPRINT"]],
+                                    doGenerateSubmoduleConfigurations: false,
+                                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'src']],
+                                    submoduleCfg: [],
+                                    userRemoteConfigs: [[credentialsId: GIT_READ_KEY, url: REPO_TO_BUILD]]
+                                ])
+                            }
+                        }
+                    }
+                    post
+                    {
+                        success
+                        {
+                            script
+                            {
+                                BUILD_STATE="1"
+                                sh """
+                                    echo "BUILD_STATE=${BUILD_STATE}" >> ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build
+                                """
+                                BUILD_STATE=""
+                                if(IS_UPLOAD && !ALREADY_SUCCESS)
+                                {
+                                    sh """
+                                        mv -f  ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/temp/${GIT_HASH_LONG}.build ${PERMANENT_STORE}builds/${props.PROJECT_NAME}/
+                                    """
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post
+    {
+        always
+        {
+            node(AGENT_LABEL)
+            {
+                script
+                {
+                    setPipelineState(GITLAB_ID, 'wstn-agg_git_api_token', GIT_HASH_LONG, CHECK_STATE)
+                    /*
+                    if(params.SONAR_CHECK_GATE && SONAR_PROJECT_NAME != null && SONAR_PROJECT_KEY != null)
+                    {
+                        setPipelineState(GITLAB_ID, 'wstn-agg_git_api_token', GIT_HASH_LONG, CHECK_STATE)
+                    }
+                    */
+                }
+            }
+        }
+    }
+}
+
+def setPipelineState(gitlabProjectId, credentialsId, gitSha, pipelineState)
+{
+    withCredentials([string(credentialsId: "$credentialsId", variable: 'TOKEN')])
+    {
+        sh """
+            API_URL="https://git.devops.broadridge.net/api/v4/projects/$gitlabProjectId/statuses/$gitSha"
+            response=`curl --request POST --header "PRIVATE-TOKEN: ${TOKEN}" -s -o /dev/null -w "%{http_code}" -d state=$pipelineState --data-urlencode "target_url=\$BUILD_URL" -d "name=\$JOB_BASE_NAME\$BUILD_DISPLAY_NAME" \$API_URL`
+    
+            if [ "\$response" -ne 201 ]; then
+                echo "Setting commit status using GitLab API failed";
+                #exit 1
+            fi
+        """
+    } 
+}
+
+def GitLabGetIdByName(path_with_namespace, credentialsId)
+{
+    def Url = "https://git.devops.broadridge.net/api/v4/projects/" + path_with_namespace.replaceAll("/","%2F")
+    def ProjectID
+    withCredentials([string(credentialsId: "$credentialsId", variable: 'TOKEN')])
+    {
+        script { ProjectID = sh (script: "curl ${Url} --header \"PRIVATE-TOKEN: ${TOKEN}\" | jq -j \".id\"", returnStdout: true).trim() }
+    }
+    return ProjectID  
+}
+
+def GitLabGitUrlByName(path_with_namespace)
+{
+    return "git@git.devops.broadridge.net:" + path_with_namespace + ".git"
+}
+
+def GitLabGetHashFromRef(gitlabProjectId, gitref, credentialsId)
+{
+    def ref_proc = gitref.startsWith("origin/") ? gitref.substring(7).replaceAll("/","%2F") : gitref.substring(7).replaceAll("/","%2F")
+    def GitHash
+    withCredentials([string(credentialsId: "$credentialsId", variable: 'TOKEN')])
+    {
+        script{GitHash = sh(script: "curl \"https://git.devops.broadridge.net/api/v4/projects/$gitlabProjectId/repository/branches/${ref_proc}\" --header \"PRIVATE-TOKEN: ${TOKEN}\" | jq -j \".commit.id\"", returnStdout: true).trim() }
+    }
+    return GitHash
+}
+
+def GitLabCheckSingleFile(gitlabProjectId, gitref, credentialsId, gitfile)
+{
+    def ref_proc = gitref.startsWith("origin/") ? gitref.substring(7).replaceAll("/","%2F") : gitref.substring(7).replaceAll("/","%2F")
+    def HttpCode
+    withCredentials([string(credentialsId: "$credentialsId", variable: 'TOKEN')])
+    {
+        script{ HttpCode = sh(script: "curl \"https://git.devops.broadridge.net/api/v4/projects/$gitlabProjectId/repository/files/${gitfile}/raw?ref=${ref_proc}\" -o /dev/null -w \"%{http_code}\" --header \"PRIVATE-TOKEN: ${TOKEN}\"" , returnStdout: true).trim() }
+    }
+    return HttpCode
+}
