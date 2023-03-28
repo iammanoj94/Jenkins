@@ -1,0 +1,29 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'ENV', defaultValue: 'dev', description: 'Target environment')
+	string(name: 'BRANCH', defaultValue: 'itg', description: '1.Dev \n2. UAT \n3. Hotfix \n4. Prod')
+        booleanParam(name: 'ENABLE_Checkout', defaultValue: true, description: 'Enable checkout code')
+	choice choices : ['Prod', 'UAT', 'QA', 'DEV'], description: 'Select the Environment'
+    }
+    stages {
+        stage('Checkout') {
+			when {
+			expression {params.Checkout == true}
+			}
+			steps {
+				script {
+					if(params.BRANCH == 'Dev'){
+					Checkout (git checkout from dev branch)
+					}
+				}
+				script {
+					if(params.BRANCH == 'main'){
+					Checkout (git checkout from main branch)
+					}
+				}
+			}
+			
+        }
+    }
+}
