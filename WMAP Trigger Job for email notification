@@ -1,0 +1,21 @@
+pipeline {
+    agent any
+
+    stages {
+        stage("Mail Notification") {
+			build job: 'Email Notification Job', parameters: [
+				string(name: 'Workflow_Name', value: "'${PROJECT_DIR_UNIXNAME}'"),
+				string(name: 'Artifact', value: "'${ARTIFACT_NAME}'"),
+				string(name: 'REL_COMMIT_ID', value: "'${REL_COMMIT_ID}'"),
+				string(name: 'buildno', value: "'${BUILD_NUMBER}'"),
+				string(name: 'jobname', value: "'${JOB_NAME}'"),
+				string(name: 'url', value: "'${BUILD_URL}'")
+			]
+		}
+        stage("Build") {
+            steps {
+                echo build
+            }
+        }
+    }
+}
