@@ -1,0 +1,40 @@
+pipeline {
+    agent any
+    parameters {
+        choice(name: 'DOMAIN', choices : ['MCR', 'poweruser', 'EDF', 'PRU'], description: 'Select the Domain name')
+		choice(name: 'BRANCH', choices: ['master', 'newdev'], description: 'Select the branch to build')
+    }
+    stages {
+        stage('Checkout') {
+			steps {
+				script {
+					if(params.DOMAIN == 'MCR'){
+					checkout([$class: 'GitSCM',
+								branches: [[name: params.BRANCH]],
+								userRemoteConfigs: [[url: 'git@git.devops.broadridge.net:gto-wmapfi/mcr.git', 
+										credentialsId: '8e5e369c-99f8-4ef8-adf9-0c4c2b91dea4']]])
+								
+					}
+				}
+				script {
+					if(params.DOMAIN == 'PRU'){
+					checkout([$class: 'GitSCM',
+								branches: [[name: params.BRANCH]],
+								userRemoteConfigs: [[url: 'git@git.devops.broadridge.net:gto-wmapfi/pru.git',
+								credentialsId: 'WMAP_FI_Application_Keys_Ssh']]])
+					}
+				}
+			}
+		}
+		stage('Build') {
+			steps {
+                sh '''
+					ls -ltr
+					pwd
+					
+					echo "Domain: ${DOMAIN}, Branch:${BRANCH} " 
+				'''
+			}
+		}
+	}
+}
