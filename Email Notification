@@ -1,0 +1,82 @@
+pipeline {
+    agent any
+    stages {
+        stage('Email Jenkins Pipeline') {
+            steps {
+				script {
+					emailext to: "manoj.nagam@braodridge.com",
+					subject: "Deployment Started:'${env.JOB_NAME}' Build No- '${env.BUILD_NUMBER}'" ,
+					body: """Hi Team,
+
+Deployment STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'
+Check console output at URL: '${env.BUILD_URL}'
+Parameters provided
+	Version: 
+	folder:
+	commit_ID """
+            }
+        }
+		stage('Build Code') {
+			steps {
+			  echo "Building the Code....."
+			}
+		}
+	}
+// send mail notification always
+		
+	post{
+        always{
+            emailext attachLog: true, 
+            body: """Hi Team,
+
+		Deployment Successful: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'
+		Check console output at URL: '${env.BUILD_URL}'
+		Parameters provided
+			Version: 
+			folder:
+			commit_ID """, 
+            subject: "Jenkins Notification: STARTED: '${env.JOB_NAME}' Build No- '${env.BUILD_NUMBER}'", 
+            to: 'manoj.nagam@broadridge.com;durga.prasad@broadridge.com'
+        }
+    }
+	
+## To send a mail only on job failure(success)
+	post{
+        failure{
+            emailext to: "naivetechblog@gmail.com",
+            subject: "jenkins build:${currentBuild.currentResult}: ${env.JOB_NAME}",
+            body: "${currentBuild.currentResult}: Job ${env.JOB_NAME}\nMore Info can be found here: ${env.BUILD_URL}"
+        }
+    }
+	
+}
+
+
+
+
+=====================================
+pipeline {
+    agent { label 'WMAPFI_DEPLOY_INFA_SERVER_NEW' }
+    stages {
+        stage('Hello') {
+            steps {
+                echo "Hello world"
+                    }
+            }
+        }
+    post{
+        always{
+            emailext attachLog: true, 
+            body: """Hi Team,
+
+            Deployment STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'
+            Check console output at URL: '${env.BUILD_URL}'
+            Parameters provided
+                Version: 
+                folder:
+                commit_ID """, 
+            subject: "Jenkins Notification: STARTED: '${env.JOB_NAME}' Build No- '${env.BUILD_NUMBER}'", 
+            to: 'manoj.nagam@broadridge.com, manojkumarn1@hexaware.com'
+        }
+    }
+}
