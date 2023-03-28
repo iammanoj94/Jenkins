@@ -1,0 +1,72 @@
+def prod_etl_servers = "BGCCLVFIETLP1, BGCCLVFIETLP3, BGCCLVFIETLP4"
+def prod_sql_servers = "BGCCLVFISQLP1, BGCCLVFISQLP2"
+def prod_oradb_servers = "BGCCLVFIDBP1, BGCCLVFIDBP2"
+
+def uat_etl_servers = "BGCCLVFIETLU1, BGCCLVFIETLU2, BGCCLVFIETLU3"
+def uat_sql_servers = "BGCCLVFISQLU1, BGCCLVFISQLU2"
+def uat_oradb_servers = "BGCCLVFIDBU1, BGCCLVFIDBU2 "
+
+def qa_etl_servers = "BGCCLVFIETLQ1, BGCCLVFIETLQ2"
+def qa_sql_servers = "BGCCLVFISQLQ1"
+def qa_oradb_servers = "BGCCLVFIDBQ1"
+
+pipeline {
+    agent any
+	parameters {	
+		choice(choices : ['PROD', 'UAT', 'QA'], description: 'Select the Environment', name : 'CHOICE')
+//		string(name: 'somestring', defaultValue: 'somevalue'), [$class: 'DateParameterDefinition', name: 'somedate', dateFormat: 'yyyyMMdd', defaultValue: 'LocalDate.now()']
+	}
+    stages {
+        stage('Filtering Servers List') {
+			
+			steps {
+				script {
+					if(params.CHOICE == 'PROD'){
+					env.etl_servers = prod_etl_servers
+					env.sql_servers = prod_sql_servers
+					env.oradb_servers = prod_oradb_servers
+					echo "ETL Nodes:  ${prod_etl_servers} "
+					echo " SQL DB Nodes: ${prod_sql_servers} "
+					echo "Oracle DB Nodes: ${prod_oradb_servers}"
+					}
+				}
+				script {
+					if(params.CHOICE == 'UAT'){
+					env.etl_servers = uat_etl_servers
+					env.sql_servers = uat_sql_servers
+				    env.oradb_servers = uat_oradb_servers
+					}
+				}
+				script {
+					if(params.CHOICE == 'QA'){
+					env.etl_servers = qa_etl_servers
+					env.sql_servers = qa_sql_servers
+				    env.oradb_servers = qa_oradb_servers
+					}
+				}
+			}
+			
+        }
+    }
+		
+	post{
+        always{
+			emailext to: 'manoj.nagam@broadridge.com',
+			subject: "GTOWMAPAN-49 - UNIX OS Patching Notification: ${params.CHOICE} servers'",
+            body: """
+Hi Team,
+			
+There is a patching window has been scheduled for next couple of hours. During the patching window below servers wont be available.
+
+Broadridge TSS team will be applying the UNIX OS patching in ${params.CHOICE} environment.
+
+Below servers will not available during Patching window.
+
+ETL Nodes:  ${etl_servers} \n
+SQL DB Nodes: ${sql_servers} \n
+Oracle DB Nodes: ${oradb_servers}
+
+Please reachout to WMAP-File Interface Team for any concerns"""
+        }
+    }
+}
