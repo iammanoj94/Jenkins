@@ -1,0 +1,405 @@
+#!groovy
+def timeStamp = Calendar.getInstance().getTime().format('YYYYMMdd-hhmmss',TimeZone.getTimeZone('UTC'))
+env.PKG_TIMESTAMP = timeStamp
+def releaseArtifact
+def SCID
+properties([
+    parameters ([
+        separator(name: "BUILD_ENVIRONMENT", sectionHeader: "Release Parameters",
+			separatorStyle: """
+			border: 0;
+			border-bottom: 1px dashed #ccc; 
+			background: #999; 
+			""",
+			sectionHeaderStyle: """
+			    color: white;
+                background: darkblue;
+                font-family: Roboto, sans-serif !important;
+                padding: 5px;
+                text-align: center;
+                font-weight: bold;
+			"""
+		),
+		//string(name: 'CUSTOM_SCID', defaultValue: '', description: '### Input Custom SCID if you are running a patch/incremental deployment Syntax : FTECH-EISL-MI-NH-SCID_DATE-TIMESTAMP.PATCHNUM ex : FTECH-EISL-MI-NH-SCID_20220801-094220.001'),
+		//booleanParam(name: 'publish2prod', defaultValue: false,description: 'check this parameter to publish the artifact to prod artifactory EISL/mi-releases/ repo'),
+		string(name: 'EISL_NOTIFICATION_HUB_BRANCH', defaultValue: 'sprint93', description: 'EISL_NOTIFICATION_HUB Repository Branch, Tag, or Commit ID.git@git.devops.broadridge.net:EISL/notification-hub.git'),
+		string(name: 'EISL_OPERATIONAL_UI_BRANCH', defaultValue: 'sprint92', description: 'EISL_OPERATIONAL_UI Repository Branch, Tag, or Commit ID. git@git.devops.broadridge.net:EISL/operational-ui-service.git'),
+		string(name: 'EISL_SERVICES_BRANCH', defaultValue: 'sprint93', description: 'EISL_SERVICES Repository Branch, Tag, or Commit ID.git@git.devops.broadridge.net:EISL/eisl_services.git'),
+		string(name: 'EISL_GEMS_CORE_SERVICES_BRANCH', defaultValue: 'Sprint-MI-93', description: 'EISL_GEMS_CORE_SERVICES Repository Branch, Tag, or Commit ID. git@git.devops.broadridge.net:GEMS/gems_core_services.git'),
+		string(name: 'EISL_UI_BRANCH', defaultValue: 'dev', description: 'EISL_UI Repository Branch, Tag, or Commit ID.git@git.devops.broadridge.net:EISL/eisl_ui.git'),
+		string(name: 'EISL_MI_UI_BRANCH', defaultValue: 'dev', description: 'EISL_MI_UI Repository Branch, Tag, or Commit ID.git@git.devops.broadridge.net:EISL/eisl-mi-ui.git'),
+		//string(name: 'EISL_MI_NH_DB_SCRIPTS_BRANCH', defaultValue: 'dbscripts', description: 'EISL_MI_NH_DB_SCRIPTS Repository Branch, Tag, or Commit ID. git@git.devops.broadridge.net:EISL/eisl-nh-mi-db-scripts.git'),
+		string(name: 'EISL_MI_NH_TF_BRANCH', defaultValue: 'master', description: 'EISL_MI_NH_TF Repository Branch, Tag, or Commit ID.git@git.devops.broadridge.net:EISL/eisl-mi-nh-tf-fork.git'),
+		//string(name: 'EISL_MI_NH_TF_CSG_BRANCH', defaultValue: 'master', description: 'EISL_MI_NH_TF_CSG Repository Branch, Tag, or Commit ID. git@git.devops.broadridge.net:TERRAFORM/gto-bpsuseisl/eisl-mi-nh-tf.git'),
+        string(name: 'ENV_ALIAS', defaultValue: "e2", description: 'change this value to required env alias ex : e1,e2'),
+        booleanParam(name: 'service_restart', defaultValue: true, description: 'select this option to restart services post deployment'),
+        choice(choices: ['ALL_SERVICES', 'CFG_SERVICES','MI_SERVICES','EISL_SERVICES','NH_SERVICES'], description: 'Select the type of services to restart', name: 'SERVICE'),
+        string(name: 'REQUESTER_EMAIL', defaultValue: "srilalitha.chukkala@broadridge.com", description: 'Requester mail address'),
+		booleanParam(
+		  name: 'Update_Parameters', defaultValue: false,
+		  description: "If this box is checked, the parameters in the Jenkinsfile will be populated in Jenkins, and the job will end.\nIt's safe to check only this box and then execute the job.")
+    ])
+])
+
+if ( params.Update_Parameters ) {
+	echo "The Update_Parameters flag was set.  This job is now ready to execute with the updated parameters"
+	currentBuild.result = 'SUCCESS'
+	return
+}
+
+pipeline{
+    agent { label "eisl_mi_nh" }
+    environment { 
+				//CUSTOM_SCID = ''
+				publish2prod = false
+				//EISL_MI_NH_TF_BRANCH = "master"
+				EISL_MI_NH_DB_SCRIPTS_BRANCH = "dbscripts"
+				EISL_MI_NH_TF_CSG_BRANCH = "master"
+				}
+    stages{
+      stage('Delete Workspace'){
+      steps {
+        deleteDir()
+       }
+     } 
+     
+        stage("Prepare Git Repository") {
+            steps {
+                script {
+                    parallel 'Prepare Git Repository': {
+                        def nh_custom_commit_id = params.EISL_NOTIFICATION_HUB_BRANCH =~ /COMMIT_ID=/
+                        if (!nh_custom_commit_id) {
+                            nh_custom_commit_id = null
+                            git branch: "${EISL_NOTIFICATION_HUB_BRANCH}", credentialsId: 'eisl_nothub_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/notification-hub.git'
+                            EISL_NOTIFICATION_HUB_GIT_COMMIT = sh(returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_NOTIFICATION_HUB_BRANCH "
+                            nh_custom_commit_id = null
+                            NHCUSTOM_COMMIT_ID = params.EISL_NOTIFICATION_HUB_BRANCH.split('=')[1]
+                            EISL_NOTIFICATION_HUB_GIT_COMMIT = NHCUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_NOTIFICATION_HUB_GIT_COMMIT"
+                        }
+
+                        def opui_custom_commit_id = params.EISL_OPERATIONAL_UI_BRANCH =~ /COMMIT_ID=/
+                        if (!opui_custom_commit_id) {
+                            opui_custom_commit_id = null
+                            git branch: "${EISL_OPERATIONAL_UI_BRANCH}", credentialsId: 'operational_ui_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/operational-ui-service.git'
+                            dir('eisl-operational-ui') {
+                                EISL_OPERATIONAL_UI_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+                            }
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_OPERATIONAL_UI_BRANCH "
+                            opui_custom_commit_id = null
+                            OP_UI_CUSTOM_COMMIT_ID = params.EISL_OPERATIONAL_UI_BRANCH.split('=')[1]
+                            EISL_OPERATIONAL_UI_GIT_COMMIT = OP_UI_CUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_OPERATIONAL_UI_GIT_COMMIT"
+                        }
+
+                        def miui_custom_commit_id = params.EISL_MI_UI_BRANCH =~ /COMMIT_ID=/
+                        if (!miui_custom_commit_id) {
+                            miui_custom_commit_id = null
+                            git branch: "${EISL_MI_UI_BRANCH}", credentialsId: 'eisl_mapping_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/eisl-mi-ui.git'
+							 dir('mi-ui-service') {
+								EISL_MI_UI_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+							 }
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_MI_UI_BRANCH "
+                            miui_custom_commit_id = null
+                            MI_UI_CUSTOM_COMMIT_ID = params.EISL_MI_UI_BRANCH.split('=')[1]
+                            EISL_MI_UI_GIT_COMMIT = MI_UI_CUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_MI_UI_GIT_COMMIT"
+                        }
+
+                        def eisl_custom_commit_id = params.EISL_SERVICES_BRANCH =~ /COMMIT_ID=/
+                        if (!eisl_custom_commit_id) {
+                            eisl_custom_commit_id = null
+                            git branch: "${EISL_SERVICES_BRANCH}", credentialsId: 'eisl_services_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/eisl_services.git'
+							 dir('eisl-services') {
+								EISL_SERVICES_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+							 }
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_SERVICES_BRANCH "
+                            eisl_custom_commit_id = null
+                            EISLCUSTOM_COMMIT_ID = params.EISL_SERVICES_BRANCH.split('=')[1]
+                            EISL_SERVICES_GIT_COMMIT = EISLCUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_SERVICES_GIT_COMMIT"
+                        }
+
+                        def eisl_mi_custom_commit_id = params.EISL_GEMS_CORE_SERVICES_BRANCH =~ /COMMIT_ID=/
+                        if (!eisl_mi_custom_commit_id) {
+                            eisl_mi_custom_commit_id = null
+                            git branch: "${EISL_GEMS_CORE_SERVICES_BRANCH}", credentialsId: 'eisl_services_gitlab_ro', url: 'git@git.devops.broadridge.net:GEMS/gems_core_services.git'
+							 dir('eisl-gems-core-services') {
+								EISL_GEMS_CORE_SERVICES_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+							 }
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_GEMS_CORE_SERVICES_BRANCH "
+                            eisl_mi_custom_commit_id = null
+                            EISLMI_CUSTOM_COMMIT_ID = params.EISL_GEMS_CORE_SERVICES_BRANCH.split('=')[1]
+                            EISL_GEMS_CORE_SERVICES_GIT_COMMIT = EISLMI_CUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_GEMS_CORE_SERVICES_GIT_COMMIT"
+                        }
+
+                        def eisl_ui_custom_commit_id = params.EISL_UI_BRANCH =~ /COMMIT_ID=/
+                        if (!eisl_ui_custom_commit_id) {
+                            eisl_ui_custom_commit_id = null
+                            git branch: "${EISL_UI_BRANCH}", credentialsId: 'eisl_services_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/eisl_ui.git'
+							 dir('eisl-ui') {
+								EISL_UI_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+							 }
+                        }
+                        else {
+                            echo "## CUSTOM COMMIT_ID REQUESTED ## Skipping the Git repository checkout for EISL_UI_BRANCH "
+                            eisl_ui_custom_commit_id = null
+                            EISLUI_CUSTOM_COMMIT_ID = params.EISL_UI_BRANCH.split('=')[1]
+                            EISL_UI_GIT_COMMIT = EISLUI_CUSTOM_COMMIT_ID[0..7]
+                            echo "$EISL_UI_GIT_COMMIT"
+                        }
+
+                        dir('eisl-mi-nh-db-scripts') {
+                        git branch: "${EISL_MI_NH_DB_SCRIPTS_BRANCH}", credentialsId: 'eisl-nh-mi-db-scripts_gitlab_ro', url: 'git@git.devops.broadridge.net:EISL/eisl-nh-mi-db-scripts.git'
+                            }
+                        dir('eisl-mi-nh-tf') {
+                        git branch: "${EISL_MI_NH_TF_BRANCH}", credentialsId: 'eisl-mi-nh-git-ro-key', url: 'git@git.devops.broadridge.net:EISL/eisl-mi-nh-tf-fork.git'
+                            }
+                        dir('eisl-mi-nh-tf-csg') {
+                        git branch: "${EISL_MI_NH_TF_CSG_BRANCH}", credentialsId: 'eisl-mi-nh-git-ro-key', url: 'git@git.devops.broadridge.net:TERRAFORM/gto-bpsuseisl/eisl-mi-nh-tf.git'
+                            }
+                    }
+
+                }
+
+              }
+            }
+        stage("Deployment Metadata"){
+            steps{
+                 script {
+                 dir('eisl-mi-nh-db-scripts') {
+                 EISL_MI_NH_DB_SCRIPTS_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=8 HEAD').trim()
+                 }
+                 dir('eisl-mi-nh-tf') {
+                 EISL_MI_NH_TF_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+                 }
+                 dir('eisl-mi-nh-tf-csg') {
+                 EISL_MI_NH_TF_CSG_GIT_COMMIT = sh (returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+                 }
+                
+                 sh """
+				 echo "### git@git.devops.broadridge.net:EISL/notification-hub.git", ${params.EISL_GEMS_CORE_SERVICES_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_GEMS_CORE_SERVICES_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_GEMS_CORE_SERVICES_BRANCH=${EISL_GEMS_CORE_SERVICES_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_GEMS_CORE_SERVICES_GIT_COMMIT_SHA=${EISL_GEMS_CORE_SERVICES_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+
+                 echo "### git@git.devops.broadridge.net:EISL/notification-hub.git", ${params.EISL_NOTIFICATION_HUB_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_NOTIFICATION_HUB_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_NOTIFICATION_HUB_BRANCH=${EISL_NOTIFICATION_HUB_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_NOTIFICATION_HUB_GIT_COMMIT_SHA=${EISL_NOTIFICATION_HUB_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 
+                 echo "#### git@git.devops.broadridge.net:EISL/operational-ui-service.git", ${params.EISL_OPERATIONAL_UI_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_OPERATIONAL_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_OPERATIONAL_UI_BRANCH=${EISL_OPERATIONAL_UI_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_OPERATIONAL_UI_GIT_COMMIT_SHA=${EISL_OPERATIONAL_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 
+                 echo "#### git@git.devops.broadridge.net:EISL/eisl_services.git", ${params.EISL_SERVICES_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_SERVICES_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_SERVICES_BRANCH=${EISL_SERVICES_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_SERVICES_GIT_COMMIT_SHA=${EISL_SERVICES_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+               
+                 echo "#### git@git.devops.broadridge.net:EISL/eisl_ui.git", ${params.EISL_UI_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_UI_BRANCH=${EISL_UI_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_UI_GIT_COMMIT_SHA=${EISL_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+				 
+                 echo "#### git@git.devops.broadridge.net:EISL/eisl-mi-ui.git", ${params.EISL_MI_UI_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_MI_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_UI_BRANCH=${EISL_MI_UI_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_UI_GIT_COMMIT_SHA=${EISL_MI_UI_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+				 
+                 echo "#### git@git.devops.broadridge.net:EISL/eisl-nh-mi-db-scripts.git", ${params.EISL_MI_NH_DB_SCRIPTS_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_MI_NH_DB_SCRIPTS_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_DB_SCRIPTS_BRANCH=${EISL_MI_NH_DB_SCRIPTS_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_DB_SCRIPTS_GIT_COMMIT_SHA=${EISL_MI_NH_DB_SCRIPTS_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 
+                 echo "#### git@git.devops.broadridge.net:EISL/eisl-mi-nh-tf-fork.git", ${params.EISL_MI_NH_TF_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_MI_NH_TF_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_TF_BRANCH=${EISL_MI_NH_TF_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_TF_GIT_COMMIT_SHA=${EISL_MI_NH_TF_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+				 
+                 echo "#### git@git.devops.broadridge.net:TERRAFORM/gto-bpsuseisl/eisl-mi-nh-tf.git", ${params.EISL_MI_NH_TF_CSG_BRANCH} >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "The git commit sha is ${EISL_MI_NH_TF_CSG_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_TF_CSG_BRANCH=${EISL_MI_NH_TF_CSG_BRANCH}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+                 echo "export EISL_MI_NH_TF_CSG_GIT_COMMIT_SHA=${EISL_MI_NH_TF_CSG_GIT_COMMIT}" >> FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf
+
+                 """
+                 }
+            }
+        }
+        stage('NEXUS:DEV Publish Artifacts') {
+           steps {
+				script {
+					withCredentials([usernamePassword(credentialsId: 'nexus-upload-user',
+							 passwordVariable: 'passwd',
+							 usernameVariable: 'username')]) {
+					/*if ( "${CUSTOM_SCID}" ) {
+						releaseArtifact = "${CUSTOM_SCID}.conf"
+						sh """ echo -e "\\e[1;31;42m ===== ### RELEASE_VERSION is ${releaseArtifact} ### ====== \\e[0m" """
+						
+						echo " ===== ### RELEASE_VERSION is ${releaseArtifact} ### ======"
+
+					}
+					else {
+						releaseArtifact = "bpsuseisl-bpsuseisl_1.0.0.FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf"
+						sh """ echo -e "\\e[1;31;42m ===== ### RELEASE_VERSION is ${releaseArtifact} ### ====== \\e[0m" """
+						echo " ===== ### RELEASE_VERSION is ${releaseArtifact} ### ======"
+					}
+					sh """
+							pwd
+							if [ -z "${CUSTOM_SCID}" ]; then
+									echo " #### CUSTOM_SCID is null ##### "
+									echo " Release Artifact ${releaseArtifact} "
+									curl -x "" -v -u \$username:\$passwd --upload-file FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf https://nexus.devops.broadridge.net/repository/EISL-TEST-DEV/mi-releases/${releaseArtifact}
+							else
+									echo " #### CUSTOM_SCID is not null ##### "
+									echo " Release Artifact ${releaseArtifact} "
+										mv "${WORKSPACE}/FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf" "${CUSTOM_SCID}.conf"
+										curl -x "" -v -u \$username:\$passwd --upload-file ${CUSTOM_SCID}.conf  https://nexus.devops.broadridge.net/repository/EISL-TEST-DEV/mi-releases/${CUSTOM_SCID}.conf
+							fi
+									echo "Artifact uploaded"
+						"""*/
+                    releaseArtifact = "bpsuseisl-bpsuseisl_1.0.0.FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf"
+					sh """ echo -e "\\e[1;31;42m ===== ### RELEASE_VERSION is ${releaseArtifact} ### ====== \\e[0m"
+					echo " ===== ### RELEASE_VERSION is ${releaseArtifact} ### ======"
+					echo " Release Artifact ${releaseArtifact} "
+					curl -x "" -v -u \$username:\$passwd --upload-file FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf https://nexus.devops.broadridge.net/repository/EISL-TEST-DEV/mi-releases/${releaseArtifact}
+					    """
+					}
+				}
+			sh """ echo -e "\\e[1;31;42m ===== ### RELEASE_VERSION is ${releaseArtifact} ### ====== \\e[0m" 
+                cp FTECH-EISL-MI-NH-SCID_${env.PKG_TIMESTAMP}.000.conf releases.conf
+                """
+            //deleteDir()
+			}
+		}
+        stage('Dev Docker Image Validation') {
+            steps {
+                script {
+                    sh"""
+                    echo ${releaseArtifact}>scid.txt
+                    """
+                    SCID =  readFile "${WORKSPACE}/scid.txt"
+                    print "$SCID"
+                    SCID=SCID.trim()
+                    print "$SCID"
+                    build job: 'EISL/MI-NH/Dev_Docker_Image_Validation', parameters: [
+                    string(name: 'RELEASE_VERSION', value: "${SCID}")
+                    ]
+                }
+            } 
+        }
+        stage('Terraform Dev Deployment') {
+        when{
+            expression { "${SDLC}" == "dev"}
+        }       
+        steps {       
+          script{
+                echo  "getting NOTIFICATION HUB commit ID"
+                nhub_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_NOTIFICATION_HUB_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                eisl_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_SERVICES_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                eisl_ui_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_UI_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                eisl_mi_ui_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_MI_UI_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                gems_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_GEMS_CORE_SERVICES_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                op_ui_image_version = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_OPERATIONAL_UI_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()
+                tf_artifact_commit_id = sh (
+                    script: 'cat $WORKSPACE/releases.conf | grep -i EISL_MI_NH_TF_GIT_COMMIT_SHA | cut -d "=" -f2',
+                    returnStdout: true
+                ).trim()       
+          sh """ 
+          touch latest_commit_id.tfvar
+          echo 'eisl_image_version = \"$eisl_image_version\"' > latest_commit_id.tfvar
+          echo 'eisl-ui_image_version = \"$eisl_ui_image_version\"' >> latest_commit_id.tfvar
+          echo 'eisl_mi_ui_image_version = \"$eisl_mi_ui_image_version\"' >> latest_commit_id.tfvar
+          echo 'nhub_image_version = \"$nhub_image_version\"' >> latest_commit_id.tfvar
+          echo 'gems_image_version = \"$gems_image_version\"' >> latest_commit_id.tfvar
+          echo 'op-ui_image_version = \"$op_ui_image_version\"' >> latest_commit_id.tfvar
+          echo 'tf_artifact_commit_id = \"$tf_artifact_commit_id\"'
+          echo 'live_region = \"us-east-1\"' >> latest_commit_id.tfvar
+          echo 'TF_AWS_PROVIDER = \"4.10.0\"' >> latest_commit_id.tfvar
+          #extra_parameters=`cat latest_commit_id.tfvar`
+          """
+          TF_ARTIFACT = "bpsuseisl-bpsuseisl_1.0.0-${tf_artifact_commit_id}.tar"
+              // Trigger Managed pipeline deploy job
+              extra_parameters = readFile 'latest_commit_id.tfvar'
+              build job: "EISL/MI-NH/Dev_mgp_wrapper", parameters: [
+                  string(name: 'TF_NEXUS_REPO', value: "$TF_NEXUS_REPO"),
+                  string(name: 'TF_ARTIFACT', value: "$TF_ARTIFACT"),
+                  string(name: 'TF_SEC_ARTIFACT', value: "$TF_ARTIFACT"),
+                  string(name: 'DB_ARTIFACT', value: ""),
+                  string(name: 'TF_COMMAND', value: "apply"),
+                  string(name: 'ENV_ALIAS', value: "$ENV_ALIAS"),
+                  text(name: 'CUSTOM_TF_VARS', value: "$extra_parameters" ),
+                  text(name: 'CUSTOM_TF_VARS.tfvars', value: "" ),
+                  booleanParam(name: 'db_deploy', value: "false"),
+                  booleanParam(name: 'run_iamprereqs', value: "false"),
+                  booleanParam(name: 'run_dnsr53', value: "false"),
+                  booleanParam(name: 'run_global', value: "false"),
+                  booleanParam(name: 'run_useast1', value: "true"),
+                  booleanParam(name: 'run_uswest2', value: "false"),
+                  booleanParam(name: 'service_restart', value: "${service_restart}"),
+                  string(name: 'SERVICE', value: "${SERVICE}")
+              ]
+          }
+        }
+      }
+        /*stage('NEXUS:PROD Publish Artifacts') {
+		  when{
+			  expression { params.publish2prod == true}
+		  }
+           steps {
+                withCredentials([usernamePassword(credentialsId: 'nexus-upload-user',
+                         passwordVariable: 'passwd',
+                         usernameVariable: 'username')]) {
+					script{
+						build job: 'PROMOTION/Promote_Artifact', parameters: [
+						string(name: 'NEXUS_SOURCE_REPOSITORY', value: "EISL-TEST-DEV/mi-releases/"),
+						string(name: 'NEXUS_SOURCE_ARTIFACT_NAME', value: "${releaseArtifact}"),
+						string(name: 'NEXUS_SOURCE_USER', value: "$username"),
+						password(name: 'NEXUS_SOURCE_PASSWORD', value: "$passwd")]
+					}
+				sh """ echo -e "\\e[1;31;42m ===== ### RELEASE_VERSION is ${releaseArtifact} ### ====== \\e[0m" """
+				//deleteDir()
+				}
+			}
+		}*/ 
+    }
+    post {
+        always {
+            emailext attachLog: false, 
+            body: "${releaseArtifact} created and promoted to EISL-TEST-DEV, Job : ${env.JOB_NAME} build : ${env.BUILD_NUMBER}\n More info at: ${env.BUILD_URL}",
+            subject: "${releaseArtifact} genrated and promoted to EISL-TEST-DEV, STATUS - ${currentBuild.currentResult}: Job ${env.JOB_NAME}",
+			to: "${REQUESTER_EMAIL}"
+        }
+    }
+}
