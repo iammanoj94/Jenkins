@@ -1,0 +1,66 @@
+pipeline {
+    agent { label 'jsidvwascb11' }
+    options {
+            buildDiscarder(
+                logRotator(
+                     numToKeepStr: '30'
+                )
+            )
+      }
+    environment {
+        artifactId = 'PMHW_DB'
+        releaseLabel = '1.2.1.0'
+        artifactName = "${env.artifactId}_${env.releaseLabel}.zip"
+    }
+    stages {
+        stage('Build') {
+            steps {
+                echo "Creating ${env.artifactId} release ${env.releaseLabel} as ${artifactName}"
+                zip dir: '', glob: '', zipFile: "./${env.artifactName}"
+            }
+        }
+        stage('Publish to Nexus') {
+            steps {
+                echo "Pushing ${env.artifactId} release ${env.releaseLabel} as ${artifactName} to Nexus"
+                uploadArtifact(ARTIFACT: "${artifactName}", ARTIFACT_SUBFOLDER: "${artifactId}")
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                if (env.gitlabBranch == 'v1') {
+                    build job : 'PMHW_DB_Deploy_Single',
+                    parameters: [
+                        [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                        [$class: 'StringParameterValue', name: 'client_ids', value: '096'],
+                        [$class: 'StringParameterValue', name: 'server_name', value: 'JSIDVWASCD01'],
+                        [$class: 'StringParameterValue', name: 'artifactId', value: "${artifactId}"],
+                        [$class: 'StringParameterValue', name: 'version', value: "${env.releaseLabel}"]
+                    ],
+                    wait: false,
+                    propagate: false
+                }
+            }
+        }
+        failure {
+            mail bcc: '',
+                body: """${env.gitlabUserName},
+
+                The following job failed: ${env.JOB_NAME}
+
+                Build: ${env.BUILD_URL}
+
+                Triggered by commit: ${env.GIT_COMMIT}
+
+                Branch: ${gitlabBranch}
+                """,
+                cc: '',
+                subject: 'Job Failed',
+                to: "baihdevelopment@broadridge.com"
+        }
+        cleanup {
+            cleanWs()
+        }
+    }
+}
