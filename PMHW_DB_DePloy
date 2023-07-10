@@ -1,0 +1,85 @@
+pipeline {
+    agent { label "${params.server_name}" }
+    environment {
+        foldername = "${params.artifactId}_${params.version}"
+        filename = "${params.artifactId}_${params.version}.zip"
+        repository = "RAW-HOSTED"
+        devopsrepo = "${DEVOPS_SHORT_NAME}".toLowerCase()
+    }
+    parameters {
+        string(name: 'client_ids',  defaultValue: '', trim: true)
+        string(name: 'server_name',  defaultValue: '', trim: true)
+        string(name: 'artifactId',   defaultValue: 'PMHW_DB', trim: true)
+        string(name: 'version',      defaultValue: '', trim: true)
+        string(name: 'upstream_job_name', defaultValue: 'MANUAL', description: 'Name of the upstream job that triggers this job, will be used to determine which repository to pull from', trim: true)
+    }
+    stages {
+        stage('Download') {
+            steps {
+                cleanWs()
+                script {
+                    //echo "env.SDLC: ${env.SDLC}"
+                    def repo = "${repository}"
+                    if (SDLC == 'dev' || SDLC == 'int') {
+                        echo "Deploying to ${SDLC}, switching to test repo"
+                        repo = "${repository}-TEST-DEV"
+                    }
+                    nexusUrl = "${env.NEXUS_SERVER_URL}/repository/${repo}/${devopsrepo}/${params.artifactId}/${filename}"
+                }
+
+                withCredentials([usernamePassword(credentialsId: 'nexus-download-user', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                    echo "PULLING FROM : ${nexusUrl}"
+                    bat """
+                        curl --ssl-no-revoke -k --user ${user}:${pass} --url ${nexusUrl} -o ${env.filename}
+                    """
+                }
+            }
+        }
+        stage('Extract') {
+            steps {
+                powershell label: '', script: """
+                
+                    \$exists = Test-Path -Path "D:\\Deployments"
+                    if (\$exists -eq \$false) {
+                        Write-Host "Creating release folder D:\\Deployments"
+                        New-Item -Path "D:\\Deployments" -ItemType "directory" -ErrorAction Stop
+                        Write-Host "Completed creation"
+                        Start-Sleep 3
+                    }
+
+                    \$exists = Test-Path -Path "D:\\Deployments\\${env.foldername}"
+                    if (\$exists -eq \$true) {
+                        Write-Host "Deleting release folder D:\\Deployments\\${env.foldername}"
+                        Remove-Item -Path "D:\\Deployments\\${env.foldername}" -Recurse -Force -ErrorAction Stop
+                        Write-Host "Completed deletion"
+                        Start-Sleep 3
+                    }
+
+                    Write-Host "Extracting deployment artifacts from ${env.filename} to D:\\Deployments\\${env.foldername}"
+                    Expand-Archive -Path ${env.filename} -DestinationPath D:\\Deployments\\${env.foldername} -Force -ErrorAction Stop
+                    Write-Host "Completed extraction"
+                    Start-Sleep 3
+                """
+            }
+        }
+        stage('Deploy') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'AcndsJnknsDply_DB', passwordVariable: 'dbPass', usernameVariable: 'dbUser')]) {
+                    echo "Deploying PMHW_DB"
+                    bat """
+                        @@ECHO OFF
+                        D:
+                        CD D:\\Deployments\\${env.foldername}
+                        deployScript.bat ${params.server_name}\\SQL161 PMHW ${dbUser} ${dbPass} ${params.version} "${params.client_ids}"
+                    """
+                    echo "Deployed PMHW_DB"
+                }
+            }
+        }
+    }
+    post {
+        cleanup {
+            cleanWs()
+        }
+    }    
+}
