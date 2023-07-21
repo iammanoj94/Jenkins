@@ -1,0 +1,283 @@
+pipeline {
+    agent { label "default-agent" }
+    parameters {
+        string(name: 'version', defaultValue: '', description: 'Release version of the main PMHW aplication to deploy.', trim: true)
+        string(name: 'configversion', defaultValue: '', description: 'Release version of the main PMHW aplication configuration to deploy.', trim: true)
+        string(name: 'api_servers', defaultValue: '', description: 'List of API servers to deploy the PMHW API application to.', trim: true)
+        string(name: 'proc_servers', defaultValue: '', description: 'List of PROC servers to deploy the PMHW Processor application to.', trim: true)
+        string(name: 'db_servers_1', defaultValue: '', description: 'List of the first set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_1_clientids', defaultValue: '', description: 'List of clients for the first set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_2', defaultValue: '', description: 'List of the second set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_2_clientids', defaultValue: '', description: 'List of clients for the second set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_3', defaultValue: '', description: 'List of the third set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_3_clientids', defaultValue: '', description: 'List of clients for the third set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_4', defaultValue: '', description: 'List of the fourth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_4_clientids', defaultValue: '', description: 'List of clients for the fourth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_5', defaultValue: '', description: 'List of the fifth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_5_clientids', defaultValue: '', description: 'List of clients for the fifth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_6', defaultValue: '', description: 'List of the sixth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_6_clientids', defaultValue: '', description: 'List of clients for the sixth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_7', defaultValue: '', description: 'List of the seventh set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_7_clientids', defaultValue: '', description: 'List of clients for the seventh set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_8', defaultValue: '', description: 'List of the eighth set of DB servers to deploy the PMHW DB application to.', trim: true)
+        string(name: 'db_servers_8_clientids', defaultValue: '', description: 'List of clients for the eigth set of DB servers to deploy the PMHW DB application to.', trim: true)
+    }
+    stages {
+        stage('Deploy') {
+            steps {
+                script {
+                    echo "Deploying to ${env.SDLC}"
+                    if (!params.version?.isEmpty()) {
+                        echo "Deploying PMHW application version ${params.version}."
+                    } else {
+                        echo "PMHW application version not specified, skipping release."
+                        return 0;
+                    }
+
+                    if (!params.configversion?.isEmpty()) {
+                        echo "Using PMHW application configuration version ${params.configversion}."
+                    } else {
+                        echo "PMHW application configuration version not specified, skipping release."
+                        return 0;
+                    }
+
+                    def appServers = [];
+                    def appjobs = [:];
+                    def procServers = [];
+                    def procjobs = [:];
+                    def dbServers = [];
+                    def dbjobs = [:];
+
+                    // API Servers List
+                    if (!params.api_servers?.isEmpty()) {
+                        appServers = params.api_servers.split(',');
+                        for (appSvr in appServers) {
+                            def svr = appSvr;
+                            appjobs["pmhw_api:${svr}"] = {
+                                build job: 'PMHW_API_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_API'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"],
+                                    [$class: 'StringParameterValue', name: 'configversion', value: "${params.configversion}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW API application version ${params.version} to ${svr}."
+                        }
+                    } else {
+                        echo "PMHW API servers not specified, skipping PMHW API release"
+                    }
+
+                    // PROC Servers List
+                    if (!params.proc_servers?.isEmpty()) {
+                        procServers = params.proc_servers.split(',');
+                        for (procSvr in procServers) {
+                            def svr = procSvr;
+                            procjobs["pmhw_proc:${svr}"] = {
+                                build job: 'PMHW_PROC_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_PROC'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"],
+                                    [$class: 'StringParameterValue', name: 'configversion', value: "${params.configversion}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW Processor application version ${params.version} to ${svr}."
+                        }
+                    } else {
+                        echo "PMHW PROC servers not specified, skipping PMHW Processor release"
+                    }
+
+                    // DB Servers List 1
+                    if (!params.db_servers_1?.isEmpty() && !params.db_servers_1_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_1.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_1_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_1_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #1 not specified, skipping PMHW DB release for List #1."
+                    }
+
+                    // DB Servers List 2
+                    if (!params.db_servers_2?.isEmpty() && !params.db_servers_2_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_2.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_2_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_2_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #2 not specified, skipping PMHW DB release for List #2."
+                    }
+
+                    // DB Servers List 3
+                    if (!params.db_servers_3?.isEmpty() && !params.db_servers_3_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_3.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_3_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_3_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #3 not specified, skipping PMHW DB release for List #3."
+                    }
+
+                    // DB Servers List 4
+                    if (!params.db_servers_4?.isEmpty() && !params.db_servers_4_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_4.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_4_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_4_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #4 not specified, skipping PMHW DB release for List #4."
+                    }
+
+                    // DB Servers List 5
+                    if (!params.db_servers_5?.isEmpty() && !params.db_servers_5_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_5.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_5_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_5_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #5 not specified, skipping PMHW DB release for List #5."
+                    }
+
+                    // DB Servers List 6
+                    if (!params.db_servers_6?.isEmpty() && !params.db_servers_6_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_6.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_6_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_6_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #6 not specified, skipping PMHW DB release for List #6."
+                    }
+
+                    // DB Servers List 7
+                    if (!params.db_servers_7?.isEmpty() && !params.db_servers_7_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_7.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_7_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_7_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #7 not specified, skipping PMHW DB release for List #7."
+                    }
+
+                    // DB Servers List 8
+                    if (!params.db_servers_8?.isEmpty() && !params.db_servers_8_clientids?.isEmpty()) {
+                        dbServers = params.db_servers_8.split(',');
+                        for (dbSvr in dbServers) {
+                            def svr = dbSvr;
+                            dbjobs["pmhw_db:${svr}"] = {
+                                build job: 'PMHW_DB_Deploy_Single',
+                                parameters: [
+                                    [$class: 'StringParameterValue', name: 'upstream_job_name', value: "${env.JOB_BASE_NAME}"],
+                                    [$class: 'StringParameterValue', name: 'client_ids', value: params.db_servers_8_clientids],
+                                    [$class: 'StringParameterValue', name: 'server_name', value: svr],
+                                    [$class: 'StringParameterValue', name: 'artifactId', value: 'PMHW_DB'],
+                                    [$class: 'StringParameterValue', name: 'version', value: "${params.version}"]
+                                ],
+                                propagate: true
+                            }
+                            echo "Will deploy PMHW DB application version ${params.version} to ${svr} for clients ${params.db_servers_8_clientids}."
+                        }
+                    } else {
+                        echo "PMHW DB servers and/or Client IDs List #8 not specified, skipping PMHW DB release for List #8."
+                    }
+
+                    parallel dbjobs
+                    parallel appjobs
+                    parallel procjobs
+                }
+            }
+        }
+    }
+    post {
+        cleanup {
+            cleanWs()
+        }
+    }
+}
