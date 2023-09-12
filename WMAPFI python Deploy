@@ -1,0 +1,152 @@
+#!groovy
+def ARTIFACT_NAME
+def ARTIFACT_NAME_TAR_FILE
+def COMMIT_ID
+def GIT_COMMIT_ID
+def timeStamp = Calendar.getInstance().getTime().format('YYYYMMdd',TimeZone.getTimeZone('UTC'))
+def NEXUS_SERVER_URL = "https://nexus.devops.broadridge.net"
+env.PKG_TIMESTAMP = timeStamp
+pipeline{
+    agent { label 'WMAPFI_DEPLOY_INFA_SERVER_NEW' }
+    
+    stages{
+        stage('Delete Workspace'){
+			steps {
+				deleteDir()
+			}
+		}
+		stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                          branches: [[name: GIT_BRANCH]],
+                          userRemoteConfigs: [[url: 'git@git.devops.broadridge.net:gto-wmapfi/eisl_file_validation.git',credentialsId:'WMAP_FI_Application_Keys_Ssh']]])
+            }
+        }		
+		stage('Build') {
+            steps {
+                script{
+					sh '''
+                    GIT_COMMIT_ID=$(echo ${GIT_COMMIT}| cut -c1-6)
+					COMMIT_ID="${GIT_COMMIT}"
+                    echo "Commit ID is $GIT_COMMIT_ID"
+                    echo "Branch is $GIT_BRANCH"
+                    DATE=$(date +"%m%d%Y_%H%M")
+                    if [[ "$GIT_BRANCH" == "release" ]]; then
+                        ARTIFACT_NAME="pythonCode__REL_${GIT_COMMIT_ID}_${DATE}"
+						ARTIFACT_NAME_TAR_FILE=${ARTIFACT_NAME}.tar
+						echo "Artifact is ${ARTIFACT_NAME} & Tar name is ${ARTIFACT_NAME_TAR_FILE}"
+						ls -ltr
+						echo "creating Artifact tar archive"
+						tar -czvf "${ARTIFACT_NAME_TAR_FILE}" *
+						if [[ $? = 0 ]]; then
+							echo "Tar file created successfully"
+						else
+							echo "error occured during Tar file creation"
+						fi
+						ls -lt ${ARTIFACT_NAME_TAR_FILE}
+						
+                    elif [[ "$GIT_BRANCH" == "develop" ]]; then
+						ARTIFACT_NAME="pythonCode_${GIT_COMMIT_ID}_${DATE}"
+						ARTIFACT_NAME_TAR_FILE=${ARTIFACT_NAME}.tar
+						echo "Artifact is ${ARTIFACT_NAME} & Tar name is ${ARTIFACT_NAME_TAR_FILE}"
+						ls -ltr
+						echo "creating Artifact tar archive"
+						tar -czvf "${ARTIFACT_NAME_TAR_FILE}" *
+						if [[ $? = 0 ]]; then
+							echo "Tar file created successfully"
+						else
+							echo "error occured during Tar file creation"
+						fi
+						ls -lt ${ARTIFACT_NAME_TAR_FILE}
+                    
+                    else
+                        echo "Master branch will not be deployed"
+                        exit 10
+                    fi
+					'''
+                }
+            }
+        }
+                                
+        stage('Upload Artifact to JFROG') {
+            steps {
+                script{
+					echo 'Uploading Artifacts to Nexus Repository..'
+					withCredentials([usernamePassword(credentialsId: 'nexus-upload-user', passwordVariable: 'NEXUS_PASSWORD', usernameVariable: 'NEXUS_USER')]){
+						sh '''
+						NEXUS_REPOSITORY="${DEVOPS_SHORT_NAME}"
+						NEXUS_REPOSITORY="RAW-HOSTED-TEST-DEV/${NEXUS_REPOSITORY}"
+						echo $NEXUS_SERVER_URL
+						echo ARTIFACT_NAME_TAR_FILE: $ARTIFACT_NAME_TAR_FILE
+						ARTIFACT_NAME_TAR_FILE=`ls pythonCode_*.tar`
+					
+						if [[ -s $ARTIFACT_NAME_TAR_FILE ]]; then
+							curl -u ${NEXUS_USER}:${NEXUS_PASSWORD} --upload ${ARTIFACT_NAME_TAR_FILE} $NEXUS_SERVER_URL/repository/$NEXUS_REPOSITORY/${ARTIFACT_NAME_TAR_FILE}
+							echo $ARTIFACT_NAME_TAR_FILE "Tar file uploaded successfully"
+						else
+							echo "Artifact tar file: ${ARTIFACT_NAME_TAR_FILE} Not availble/Blank "
+							exit 20
+						fi
+
+						'''
+				    }
+                }
+            }
+        }
+		
+		stage('Deploy to Dev') {
+			steps {
+                script{
+					echo "deploying on Dev"
+					//tar -xvf ${ARTIFACT_NAME}.tar 
+				}
+			}
+		}
+    }
+}
+
+
+
+
+
+pipeline {
+    agent{ label 'WMAPFI_DEPLOY_INFA_SERVER_NEW' }
+    parameters {
+        string(name: 'ARTIFACT_NAME',description: 'ARTIFACT_NAME',defaultValue: 'abcdef')
+    }
+    stages {
+        stage('Pre-Build') {
+            steps {
+                script{
+                sh '''
+                  GIT_COMMIT_ID=$(echo ${GIT_COMMIT}| cut -c1-6)
+                  echo $GIT_COMMIT_ID
+                  echo $GIT_BRANCH
+                  DATE=$(date +"%m%d%Y")
+                  if [ $GIT_BRANCH == release ]
+                  then
+                    ARTIFACT_NAME="pythonCode_${GIT_COMMIT_ID}_REL_${DATE}"
+                    echo $ARTIFACT_NAME > test.txt
+                  elif [ $GIT_BRANCH == develop ]
+                  then
+                    ARTIFACT_NAME="pythonCode_${GIT_COMMIT_ID}_${DATE}"
+                    echo $ARTIFACT_NAME > test.txt
+                  else
+                    echo "Master branch will not be deployed"
+                    exit 10
+                  fi
+                '''
+                            }
+                                            }
+                            }
+        stage('Upload Artifact to JFROG') {
+            steps {
+                script{
+                    def Artifact=readFile "${WORKSPACE}/test.txt"
+                    echo "The artifact name is $Artifact"
+                    
+                }
+            }
+        }
+    }
+}
