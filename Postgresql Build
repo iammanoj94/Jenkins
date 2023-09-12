@@ -1,0 +1,52 @@
+pipeline {
+    agent { label 'WMAPFI_DEPLOY_INFA_SERVER_NEW' }
+	parameters {
+    string(name: 'releaseLabel', defaultValue: '1.0.1', description: 'Version to be tagged for release')
+	}
+    options {
+            buildDiscarder(
+                logRotator(
+                     numToKeepStr: '30'
+                )
+            )
+    }
+    environment {
+		BRANCH = 'master'
+        artifactId = 'WMAP_FI_PgDb'
+        artifactName = "${env.artifactId}_${params.releaseLabel}.tar"
+		repo = "RAW-HOSTED-TEST-DEV"
+		devopsrepo = "${DEVOPS_SHORT_NAME}".toLowerCase()
+		CREDENTIALS_ID="WMAP_FI_Application_Keys_Ssh"
+    }
+	stages {	
+		stage('Checkout') {
+            steps {
+				cleanWs()
+				checkout([$class: 'GitSCM',
+                          branches: [[name: env.BRANCH]],
+                          userRemoteConfigs: [[url: 'git@git.devops.broadridge.net:gto-wmapfi/wmapfi_postgresql.git',credentialsId: env.CREDENTIALS_ID ]]])
+	        }
+			
+		}
+        stage('Build') {
+            steps {
+                echo "Creating ${env.artifactId} release ${env.releaseLabel} as ${artifactName}"
+                sh ''' ls -ltr '''
+                sh '''tar -czvf ${artifactName} *'''
+            }
+        }
+        stage('Publish to Nexus') {
+            steps {
+				withCredentials([usernamePassword(credentialsId: 'nexus-download-user', passwordVariable: 'pass', usernameVariable: 'user')]) {
+				script {
+					echo "Pushing ${env.artifactId} release ${env.releaseLabel} as ${artifactName} to Nexus"
+					nexusUrl = "${env.NEXUS_SERVER_URL}/repository/${repo}/${devopsrepo}"
+				}
+				sh """
+					curl -v -u ${user}:${pass} --upload ${artifactName} ${nexusUrl}/${artifactName}
+				"""
+				}
+            }
+        }
+    }
+}
