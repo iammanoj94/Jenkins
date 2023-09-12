@@ -1,0 +1,113 @@
+pipeline {
+    agent { label 'WMAPFI_DEPLOY_INFA_SERVER_NEW' }
+    environment {
+        Deploy_path= '/apps/wmapfi/postgres/deployments'
+        repository = "RAW-HOSTED"
+        devopsrepo = "${DEVOPS_SHORT_NAME}".toLowerCase()
+    }
+    parameters {
+        string(name: 'DB_Port',  defaultValue: '', description: "Enter the portnumber of database i.e 8700 or 8800", trim: true)
+        string(name: 'artifactId',   defaultValue: '', trim: true)
+		string(name: 'Database1',   defaultValue: '', description: "Enter a database name here /n Ex: WMAP_FI /nWMAP_FI_DEV", trim: true)
+		string(name: 'Database2',   defaultValue: '', description: "Enter a database name here /n Ex: WMAP_FI /nWMAP_FI_DEV", trim: true)
+    }
+	stages {
+        stage('Download') {
+            steps {
+                cleanWs()
+				script {
+                    //echo "env.SDLC: ${env.SDLC}"
+                    def repo = "${repository}"
+                    if (SDLC == 'dev' || SDLC == 'int') {
+                        echo "Deploying to ${SDLC}, switching to test repo"
+                        repo = "${repository}-TEST-DEV"
+                    }
+                    nexusUrl = "${env.NEXUS_SERVER_URL}/repository/${repo}/${devopsrepo}/${artifactId}"
+                }
+
+                withCredentials([usernamePassword(credentialsId: 'nexus-download-user', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                    echo "PULLING FROM : ${nexusUrl}"
+                    sh """
+                        curl -v -u ${user}:${pass} --url ${nexusUrl} -o ${params.artifactId}
+                    """
+                }
+			}
+		}
+		stage('Extract') {
+            steps {
+				script {
+					sh """
+					    set -e
+						echo $pwd
+						if [ -f ${params.artifactId} ]
+						then
+							# Removing old files from Postgres Deploy Directory
+							ls -ltr ${Deploy_path}
+							rm -rf ${Deploy_path}/*
+
+							# extracting tar file onTO deploy directory
+							tar -xvf ${artifactId} -C $Deploy_path							
+
+							echo "Postgres Artifacts are extracted successfully"
+						else
+							echo " Failure/Error : " ${artifactId} "Tarfile not downloaded from Nexus Repo "
+							exit 10
+						fi	
+					"""
+				}
+            }
+        }
+		stage('DB Deploy') {
+			steps {
+				script {
+					withCredentials([usernamePassword(credentialsId: 'wmapfi_postgress_db_cred', passwordVariable: 'DB_PASSWORD', usernameVariable: 'DB_USERNAME')]) {
+					if (!params.Database1.isEmpty()) {
+						echo ""
+						echo "#####   Starting Deployment for Database-1 #####"
+						echo ""
+						sh """
+							set -e
+							cd ${Deploy_path}
+							pwd
+							if [[ -s  Postgresql_deployment.sh ]]
+							then
+								find . -type f -exec chmod 755 {} +
+								./Postgresql_deployment.sh ${DB_USERNAME} ${DB_PASSWORD} ${DB_Port} ${params.Database1} ${SDLC}
+								cat script_log_${params.Database1}.txt
+							else
+								echo "Error: Valid Deploy script not-found"
+							fi
+						"""
+					}
+					else {
+                        echo "WMAP_FI Database1 is not specified, skipping Deployment for #1."
+                    }
+					
+					if (!params.Database2.isEmpty()) {
+						echo ""
+						echo "#####   Starting Deployment for Database-2 #####"
+						echo ""
+						sh """
+							set -e
+							cd ${Deploy_path}
+							pwd
+							if [[ -s  Postgresql_deployment.sh ]]
+							then
+								find . -type f -exec chmod 750 {} +
+								./Postgresql_deployment.sh ${DB_USERNAME} ${DB_PASSWORD} ${DB_Port} ${params.Database2} ${SDLC}
+								cat script_log_${params.Database1}.txt
+							else
+								echo "Error: Valid Deploy script not-found"
+							fi
+						"""
+					}
+					else {
+                        echo "WMAP_FI Database2 is not specified, skipping Deployment for #2."
+                    }
+					
+					}
+				}
+			}
+		}
+	}
+}
