@@ -1,0 +1,84 @@
+if ( SDLC == 'dev'){
+    dest_server="eks-us-east-1_b"
+} else if ( SDLC == 'int'){
+	dest_server="eks-us-east-1_c"
+} else {
+    dest_server="eks-us-east-1"
+}
+
+pipeline {
+    agent { label "${dest_server}" }
+    environment {
+        DEPLOYMENT_FILE = 'replica_count.json'
+    }
+    parameters {
+        choice(name: 'ACTION', choices: ['status', 'start', 'stop','loadreplicas'], description: 'Choose action to perform')
+        string(name: 'br-brcc-otx-xstr-default-batch', defaultValue: '', description: 'Override replica count for batch Deployment (optional)')
+        string(name: 'br-brcc-otx-xstr-default-design', defaultValue: '', description: 'Override replica count for design Deployment (optional)')
+        string(name: 'br-brcc-otx-xstr-default-empower', defaultValue: '', description: 'Override replica count for empower Deployment (optional)')
+		string(name: 'br-brcc-otx-xstr-default-ondemand', defaultValue: '', description: 'Override replica count for ondemand Deployment (optional)')
+		string(name: 'br-brcc-otx-xstr-default-orchestration', defaultValue: '', description: 'Override replica count for orchestration Deployment (optional)')
+    }
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    // Define your services (deployments) here
+                    env.SERVICES = ['br-brcc-otx-xstr-default-batch', 'br-brcc-otx-xstr-default-design', 'br-brcc-otx-xstr-default-empower', 'br-brcc-otx-xstr-default-ondemand', 'br-brcc-otx-xstr-default-orchestration'].join(',')
+                    
+                    // Load or initialize deployment replica count tracking
+                    if (!fileExists(DEPLOYMENT_FILE)) {
+                        writeFile file: DEPLOYMENT_FILE, text: '{}'
+                    }
+                    def replicaData = readJSON file: DEPLOYMENT_FILE
+                    env.REPLICA_DATA = "${replicaData}"
+                }
+            }
+        }
+        stage('Execute Action') {
+            steps {
+                script {
+                    def servicesList = env.SERVICES.split(',')
+					sh "kubectl get deployments"
+                    for (service in servicesList) {
+                        def currentReplicas = ""
+                        def replicaData = readJSON file: DEPLOYMENT_FILE
+                        def replicaOverrideParam = "${service}"
+                        def replicaOverrideValue = params[replicaOverrideParam]
+                        switch (params.ACTION) {
+                            case 'status':
+                                currentReplicas = sh(script: "kubectl get deployment ${service} -o=jsonpath='{.spec.replicas}'", returnStdout: true).trim()
+                                echo "Current replicas for ${service}: ${currentReplicas}"
+                                break
+                            case 'stop':
+                                currentReplicas = sh(script: "kubectl get deployment ${service} -o=jsonpath='{.spec.replicas}'", returnStdout: true).trim()
+                                replicaData[service] = (replicaData[service] ?: [])
+                                replicaData[service].add(currentReplicas)
+                                if (replicaData[service].size() > 8) {
+                                    replicaData[service] = replicaData[service].takeRight(8)
+                                }
+                                writeJSON file: DEPLOYMENT_FILE, json: replicaData
+                                sh "kubectl scale deployment ${service} --replicas=0"
+                                break
+							case 'loadreplicas':
+								currentReplicas = sh(script: "kubectl get deployment ${service} -o=jsonpath='{.spec.replicas}'", returnStdout: true).trim()
+                                replicaData[service] = (replicaData[service] ?: [])
+                                replicaData[service].add(currentReplicas)
+                                if (replicaData[service].size() > 8) {
+                                    replicaData[service] = replicaData[service].takeRight(8)
+                                }
+                                writeJSON file: DEPLOYMENT_FILE, json: replicaData
+								break
+                            case 'start':
+                                // def targetReplicas = replicaOverrideValue ?: (replicaData[service]?.last()?.replicas?.toInteger() ?: "")
+								def targetReplicas = replicaOverrideValue ? replicaOverrideValue.toInteger() : (replicaData[service]?.last()?.toInteger() ?: 1)
+                                sh "kubectl scale deployment ${service} --replicas=${targetReplicas}"
+                                break
+                        }
+                    }
+					sh "cat replica_count.json"
+                }
+            }
+        }
+    }
+}
