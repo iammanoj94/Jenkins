@@ -1,0 +1,1467 @@
+  // There are some conditions where we only allow plans but no applies
+// A typical use case is security groups as code
+forcePlanOnly = false
+repository = ""
+
+pipeline {
+    agent { label 'tfagent12' }
+    options {
+        ansiColor('xterm')
+    }
+    environment {
+        BUSSEG="ics"
+        PRODUCT="otx"
+        SHORT_NAME="otx"
+        CLOUD_PROVIDER="aws"
+        ACCOUNT_PREFIX="ics_otx"
+        //2.0 accounts does not have account name ending with _<sdlc>. Hence use account_prefix as TF_PROFILE
+                TF_PROFILE="ics_otx_${getSDLCEnvironment(params.SDLC_ENV)}"
+        AWS_SDK_LOAD_CONFIG="1"
+        AWS_CONFIG_FILE="${HOME}/.aws/sp_config"
+        // If not set, use us-east-1 as default
+        AWS_DEFAULT_REGION="us-east-1"
+        TFENV_AUTO_INSTALL="true"
+        TF_WARN_OUTPUT_ERRORS="1"
+        TF_IN_AUTOMATION="true"
+        DOME9_CREDS=credentials("DOME9_API")
+        DOME9_ACCESS_ID='$DOME9_CREDS_USR'
+        DOME9_SECRET_KEY='$DOME9_CREDS_PSW'
+        NEXUS_CREDS=credentials("nexus_csg_user")
+        INVENTORY_API_TOKEN=credentials("INVENTORY_API_TOKEN")
+        CMDB_USERNAME=credentials("CMDB_USERNAME")
+        CMDB_PASSWORD=credentials("CMDB_PASSWORD")
+        BRCP_PLATFORM_VERSION=1
+    }
+    stages {
+        stage('Preparation') {
+            steps {
+                cleanWs()
+                // We would like to act differently if values are not combined as expected
+                script {
+                    aws_account_id = getAWSAccountID(env.TF_PROFILE, env.CLOUD_PROVIDER)
+                    
+                    repository = params.TF_NEXUS_REPO
+                    if ((["qa", "uat", "prd"].contains(params.SDLC_ENV) && repository != "CSG") || ["int"].contains(params.SDLC_ENV) && repository != "CSG-TEST-DEV") {
+                        echo "[WARN] you run a apply from a non approved build. This pipeline will skip all apply steps"
+                        forcePlanOnly = true
+                    } else {
+                        if (env.CLOUD_PROVIDER == "aws" && "default" != "managed") {
+                            src_bucket = getBackendBucket("CSG", params.SDLC_ENV, env.BUSSEG, params.DEPLOY_MODULE, aws_account_id, env.BRCP_PLATFORM_VERSION.toInteger())
+                            src_key = getBackendKey("CSG", params.SDLC_ENV, env.BUSSEG, params.DEPLOY_MODULE, env.PRODUCT, params.ENV_ALIAS, env.BRCP_PLATFORM_VERSION.toInteger())
+                            dst_bucket = getBackendBucket(repository, params.SDLC_ENV, env.BUSSEG, params.DEPLOY_MODULE, aws_account_id, env.BRCP_PLATFORM_VERSION.toInteger())
+                            dst_key = getBackendKey(repository, params.SDLC_ENV, env.BUSSEG, params.DEPLOY_MODULE, env.PRODUCT, params.ENV_ALIAS, env.BRCP_PLATFORM_VERSION.toInteger())
+                            account_env = getAccountEnvironment(params.SDLC_ENV)
+                            
+                            // Check if the statefile exist on the CSG bucket in SS
+                            echo "[INFO] the pipeline tries to migrate existing statefiles to their current location. this step is likely to fail if there is no statefile availble, but has no impact on "
+                            state_migration_required = sh(
+                                script: "aws s3api head-object --bucket ${src_bucket} --key ${src_key} --profile ss_${account_env}",
+                                returnStatus: true
+                            ).toInteger()
+                            if (state_migration_required == 0 && ((src_bucket != dst_bucket) || (src_key != dst_key))) {
+                                echo "[INFO] terraform statefile migration is required"
+                                state_exist = sh(
+                                    script: "aws s3api head-object --bucket ${dst_bucket} --key ${dst_key} --profile ${env.TF_PROFILE}",
+                                    returnStatus: true
+                                ).toInteger()
+                                if (state_exist == 0) {
+                                    error("there are two statefiles for the same deployment on two locations. please work with CSG to get this solved.")
+                                } else {
+                                    sh "aws s3 cp s3://${src_bucket}/${src_key} ${params.DEPLOY_MODULE}.state --profile ss_${account_env}"
+                                    sh "aws s3 cp ${params.DEPLOY_MODULE}.state s3://${dst_bucket}/${dst_key} --profile ${env.TF_PROFILE}"
+                                    sh "aws s3 rm s3://${src_bucket}/${src_key} --profile ss_${account_env}"
+                                }
+                            }
+                        }
+                    }
+                    // Ensure that docker images are present on the node
+                    prepareDockerEnvironment()
+                    if (env.CLOUD_PROVIDER == "azure") {
+                        setAzureSubscriptionId(params.SDLC_ENV)
+                    }
+                }
+            }
+        }
+        stage('Download Artifact') {
+            steps {
+                script {
+                    // httpRequest plugin is not available on DEV2 jenkins
+                    // httpRequest acceptType: 'APPLICATION_TAR', authentication: 'sa-csg-dev', outputFile: 'artifact.tar', responseHandle: 'NONE', url: "https://artifacts.devops.bfsaws.net/artifactory/${repository}/${params.TF_ARTIFACT}"
+                    // https://www.jenkins.io/doc/book/pipeline/jenkinsfile/#string-interpolation
+                    withEnv(["NEXUS_REPOSITORY=${repository}", "NEXUS_ARTIFACT=${params.TF_ARTIFACT}"]){
+                        sh 'curl -f -s -u $NEXUS_CREDS_USR:$NEXUS_CREDS_PSW https://artifacts.devops.bfsaws.net/artifactory/$NEXUS_REPOSITORY/$NEXUS_ARTIFACT -o artifact.tar'
+                    }
+                    
+                    sh "rm -rf .out; mkdir .out"
+                    sh "tar -xf ./artifact.tar --directory .out/ --strip-components=1"
+
+                    if (params.DEPLOY_MODULE == "security_groups") {
+                        renderSecurityGroupsDome9(env.ACCOUNT_PREFIX, env.JOB_NAME, params.SDLC_ENV, env.WORKSPACE, env.AWS_CONFIG_FILE, aws_account_id, params.ENV_ALIAS)
+                    } else if (params.DEPLOY_MODULE == "waf_acls") {
+                        renderWafAcls(env.ACCOUNT_PREFIX, env.JOB_NAME, params.SDLC_ENV, env.WORKSPACE, env.AWS_CONFIG_FILE)
+                    } else {
+                        copyVariables(params.DEPLOY_MODULE, params.SDLC_ENV, params.CUSTOM_TF_VARS)
+                        copySecurityGroups(params.DEPLOY_MODULE, params.SDLC_ENV)
+                    }
+                    echo "[INFO] configure Terraform state backend"
+
+                    writeFile file: ".out/${params.DEPLOY_MODULE}/_backend.tfvars", text: getBackendConfiguration(
+                        (env.CLOUD_PROVIDER == "aws") ? repository : "CSG",
+                        params.SDLC_ENV,
+                        env.BUSSEG,
+                        params.DEPLOY_MODULE,
+                        env.PRODUCT,
+                        params.ENV_ALIAS,
+                        aws_account_id,
+                        env.TF_PROFILE,
+                        env.BRCP_PLATFORM_VERSION.toInteger()
+                    )
+
+                    writeFile file: ".out/${params.DEPLOY_MODULE}/providers.tf", text: getProviderConfiguration(params.CUSTOM_TF_VARS, params.DEPLOY_MODULE)
+                    
+                    // Do not override custom TF version definitions
+                    if(!fileExists(".out/.terraform-version") && !fileExists(".out/${params.DEPLOY_MODULE}/.terraform-version")) {
+                        writeFile file: ".out/${params.DEPLOY_MODULE}/.terraform-version", text: "0.12.31"    
+                    } else {
+                        echo "[INFO] the repository contains a custom .terraform-version definition. The pipeline will not override this"
+                    }
+
+                    // This creates a file that contains variables which could be overriden by app teams
+                    writeFile file: ".out/${params.DEPLOY_MODULE}/_0_platform.auto.tfvars", text: getDefaultPlatformVariables(
+                        env.PRODUCT
+                    )
+
+                    // This creates a file that contains variables for azure subscription which cannot be overridden by app teams
+                    if (env.CLOUD_PROVIDER == "azure") {
+                        writeFile file: ".out/${params.DEPLOY_MODULE}/_98_platform.auto.tfvars", text: getAzurePlatformVariables(
+                            env.AZURE_SUBSCRIPTION_ID,
+                            env.AZURE_CREDS_USR,
+                            env.AZURE_CREDS_PSW,
+                            env.AZURE_SS_CREDS_USR,
+                            env.AZURE_SS_CREDS_PSW,
+                            env.AZURE_TENANT_ID,
+                            env.AZURE_SS_SUBSCRIPTION_ID
+                        )
+                    }
+
+                    // This creates a file that contains variables which cannot be overriden by app teams
+                    writeFile file: ".out/${params.DEPLOY_MODULE}/_99_platform.auto.tfvars", text: getPlatformVariables(
+                        params.SDLC_ENV,
+                        env.BUSSEG,
+                        env.SHORT_NAME,
+                        params.ENV_ALIAS,
+                        env.ACCOUNT_PREFIX,
+                        env.BRCP_PLATFORM_VERSION.toInteger()
+                    )
+
+                    writeFile file: ".out/${params.DEPLOY_MODULE}/approved_changes.yaml", text: params.APPROVED_CHANGES
+                }
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    if ((["qa", "uat", "prd"].contains(params.SDLC_ENV) && params.DEPLOY_MODULE == "waf_acls" && repository != "CSG") || ["sbx", "dev", "int"].contains(params.SDLC_ENV) && params.DEPLOY_MODULE == "waf_acls" && repository != "CSG-TEST-DEV") {
+                        echo "[WARN] you run apply on `waf_acls` from a not approved build. This pipeline will skip all apply steps"
+                        forcePlanOnly = true
+                    }
+                    if (params.APPLY_CHANGES == false) {
+                        echo "[INFO] apply changes checkbox was not enabled. This pipeline will skip all apply steps"
+                        forcePlanOnly = true
+                    }
+                    if (params.DEPLOY_MODULE == "security_groups") {
+                        // Unapproved Tags are only added to security groups when the build is based on a non-approved build after being automatically reviewed
+                        add_unapproved_tags = false
+                         if (params.TF_COMMAND == "apply" && ["dev"].contains(params.SDLC_ENV) && params.DEPLOY_MODULE == "security_groups" && repository != "CSG-TEST-DEV") {
+                            echo "[INFO] you run apply on `security_groups` from a not approved build. This pipeline will invoke automated testing and fill fail if the test results are not compliant."
+                            checkSecurityGroups(params.SDLC_ENV)
+                            if (currentBuild.result == 'UNSTABLE') {
+                                forcePlanOnly = true
+                                currentBuild.result = 'FAILURE'
+                                throwNonCompliantSecurityGroupsError()
+                            } else {
+                                echo "[INFO] Your `security_groups` test restuls came back as valid... the pipeline will continue."
+                                forcePlanOnly = false
+                                add_unapproved_tags = true
+                                }
+                        } else {
+                            if ((["qa", "uat", "prd"].contains(params.SDLC_ENV) && params.DEPLOY_MODULE == "security_groups" && repository != "CSG") || ["sbx", "dev", "int"].contains(params.SDLC_ENV) && params.DEPLOY_MODULE == "security_groups" && repository != "CSG-TEST-DEV") {
+                                echo "[WARN] you run apply on `security_groups` from a not approved build. This pipeline will skip all apply steps"
+                                forcePlanOnly = true
+                            }
+                        }
+                        // Invoke the Security Groups Migration
+                        echo "[INFO] Starting Security Groups as Code migration..."
+                        // Initialize the original codebase
+                        invokeTerraformCommand("terraform init -compact-warnings -backend-config=_backend.tfvars", params.DEPLOY_MODULE)
+                        // Pull the current Statefile
+                        invokeTerraformCommand("terraform state pull > dome9.tfstate", params.DEPLOY_MODULE)
+                        // Render the new codebase
+                        renderSecurityGroupsAWS(env.ACCOUNT_PREFIX, env.JOB_NAME, params.SDLC_ENV, env.WORKSPACE, env.AWS_CONFIG_FILE, aws_account_id, params.ENV_ALIAS, add_unapproved_tags)
+                        // Create a new backend configuration to ensure that there are no conflicts
+                        writeFile file: ".out/${params.DEPLOY_MODULE}/_backend.tfvars", text: getBackendConfiguration(
+                            (env.CLOUD_PROVIDER == "aws") ? repository : "CSG",
+                            params.SDLC_ENV,
+                            env.BUSSEG,
+                            "security_groups_aws",
+                            env.PRODUCT,
+                            params.ENV_ALIAS,
+                            aws_account_id,
+                            env.TF_PROFILE,
+                            env.BRCP_PLATFORM_VERSION.toInteger()
+                        )
+                        invokeTerraformCommand("terraform init -compact-warnings -backend-config=_backend.tfvars", params.DEPLOY_MODULE)
+                        // Pull the AWS Statefile
+                        invokeTerraformCommand("terraform state pull > aws.tfstate", params.DEPLOY_MODULE)
+                        // Import existing resources into the new or pulled statefile
+                        convertSecurityGroupsStatefile(env.ACCOUNT_PREFIX, env.JOB_NAME, params.SDLC_ENV, env.WORKSPACE, env.AWS_CONFIG_FILE, aws_account_id, params.ENV_ALIAS)
+                        // Push the updated Statefile
+                        invokeTerraformCommand("terraform state push aws_updated.tfstate", params.DEPLOY_MODULE)
+                    }
+                    // Destroy is always allowed and does not follow under the REPO requirements
+                    if (params.TF_COMMAND == "destroy") {
+                        forcePlanOnly = false
+                    }
+
+                    // Skip tf init for state-unlock because it will fail if the state file is locked
+                    if (params.TF_COMMAND != "state-unlock") {
+                        invokeTerraformCommand("terraform init -compact-warnings -backend-config=_backend.tfvars", params.DEPLOY_MODULE)
+                    }
+                    echo "[INFO] Terraform version details:"
+                    invokeTerraformCommand("terraform version", params.DEPLOY_MODULE)
+
+                    switch(params.TF_COMMAND) {
+                        case "taint":
+                            setBuildDescription("taint")
+                            invokeTerraformCommand("terraform taint ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "untaint":
+                            setBuildDescription("untaint")
+                            invokeTerraformCommand("terraform untaint ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "output":
+                            setBuildDescription("output")
+                            invokeTerraformCommand("terraform output -json", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "graph":
+                            setBuildDescription("graph")
+                            invokeTerraformCommand("terraform graph", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "refresh":
+                            setBuildDescription("refresh")
+                            invokeTerraformCommand("terraform refresh", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "show":
+                            setBuildDescription("show")
+                            invokeTerraformCommand("terraform show", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "plan":
+                            setBuildDescription("plan")
+                            invokeTerraformPipelineSteps = true
+                            invokeApplySteps = false
+                            break
+                        case "apply":
+                            setBuildDescription("apply")
+                            invokeTerraformPipelineSteps = true
+                            invokeApplySteps = true
+                            break
+                        case "destroy":
+                            setBuildDescription("destroy")
+                            invokeTerraformPipelineSteps = true
+                            invokeApplySteps = true
+                            break
+                        case "state-update-providers":
+                            setBuildDescription("state-update-providers")
+                            timeout(time: 60, unit: 'MINUTES') {
+                                input(
+                                    id: "approval",
+                                    message: "This action will update your state file to Terraform 0.13+ providers and cannot be reversed without a JSD ticket and assistance from CSG. Are you sure you wish to proceed?"
+                                )
+				            }
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/aws hashicorp/aws", params.DEPLOY_MODULE)
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/random hashicorp/random", params.DEPLOY_MODULE)
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/template hashicorp/template", params.DEPLOY_MODULE)
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/null hashicorp/null", params.DEPLOY_MODULE)
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/external hashicorp/external", params.DEPLOY_MODULE)
+                            invokeTerraformCommand("terraform state replace-provider -auto-approve registry.terraform.io/-/dome9 terraform.prd.bfsaws.net/next-gen/dome9", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "state-list":
+                            setBuildDescription("state-list")
+                            invokeTerraformCommand("terraform state list ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "state-move":
+                            setBuildDescription("state-move")
+                            invokeTerraformCommand("terraform state mv ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "state-remove":
+                            setBuildDescription("state-remove")
+                            invokeTerraformCommand("terraform state rm ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "state-show":
+                            setBuildDescription("state-show")
+                            invokeTerraformCommand("terraform state show ${params.TF_TARGET}", params.DEPLOY_MODULE)
+                            invokeTerraformPipelineSteps = false
+                            break
+                        case "state-unlock":
+                            setBuildDescription("state-unlock")
+                            unlockStatusCode = unlockState(params.TF_NEXUS_REPO, params.SDLC_ENV, env.BUSSEG, params.DEPLOY_MODULE, env.PRODUCT, params.ENV_ALIAS, aws_account_id, env.BRCP_PLATFORM_VERSION.toInteger())
+                            invokeTerraformPipelineSteps = false
+                            if (unlockStatusCode == 0) {
+                                echo "[INFO] State file unlocked!"
+                            }
+                            break
+                                                case "generate-code":
+                            setBuildDescription("generate-code")
+                            invokeTerraformPipelineSteps = true
+                            invokeApplySteps = false
+                            break
+                        default:
+                            error("invalid step selection. please check our input parameters")
+                            break
+                    }
+                }
+            }
+        }
+        stage('Validate') {
+            when {
+                expression {
+                    invokeTerraformPipelineSteps == true
+                }
+            }
+            steps {
+                invokeTerraformCommand("terraform validate", params.DEPLOY_MODULE)
+            }
+        }
+        stage('Plan') {
+            when {
+                expression {
+                    invokeTerraformPipelineSteps == true
+                }
+            }
+            steps {
+                script {
+                    def targetArgs = ""
+                    if (params.TF_TARGET) {
+                        targetArgs = params.TF_TARGET.split(" ").collect { "-target ${it}" }.join(" ")
+                    } else {
+                        targetArgs = ""
+                    }
+                    switch(params.TF_COMMAND) {
+                        case "destroy":
+                            requireApproval = true
+                            planResultStatusCode = invokeTerraformCommand("terraform plan ${targetArgs} -compact-warnings -destroy -out=plan.tfplan -detailed-exitcode", params.DEPLOY_MODULE)
+                            break
+                        case "generate-code":
+                            requireApproval = false
+                            planResultStatusCode = invokeTerraformCommand("terraform plan ${targetArgs} -compact-warnings -generate-config-out=_generated_code.tf -detailed-exitcode -out=plan.tfplan", params.DEPLOY_MODULE)
+                            break
+                        default:
+                            requireApproval = params.REQUIRE_APPROVAL
+                            planResultStatusCode = invokeTerraformCommand("terraform plan ${targetArgs} -compact-warnings -detailed-exitcode -out=plan.tfplan", params.DEPLOY_MODULE)
+                    }
+
+                    if (planResultStatusCode == 2) {
+                        // Convert binary planfile into JSON format
+                        invokeTerraformCommand("terraform show -no-color -json plan.tfplan > plan.json", params.DEPLOY_MODULE)
+                        // Invoke Checkov Compliance Scan
+                        invokeCheckov(params.DEPLOY_MODULE)
+                        // Validate APPROVED_CHANGES against plan for Apply and Destroy commands
+                        if (requireApproval && invokeApplySteps) {
+                            approved = checkApproved()
+                            if (approved == 0) {
+                                requireApproval = false
+                            } else {
+                                requireApproval = true
+                            }
+                        }
+                        // Generate CFA Nightwatch summary
+                        plan_summary = getPlanSummary(params.DEPLOY_MODULE)
+                        // We do not want to include that into the archive artifact
+                        writeFile file: "changes.yaml", text: plan_summary
+                        echo(plan_summary)
+                    }
+                }
+            }
+        }
+        stage('Approval') {
+            when {
+                expression {
+                    invokeTerraformPipelineSteps == true &&
+                    requireApproval == true &&
+                    planResultStatusCode == 2 && 
+                    invokeApplySteps == true &&
+                    forcePlanOnly == false
+                }
+            }
+            steps {
+                timeout(time: 60, unit: 'MINUTES') {
+					input(
+                        id: "approval",
+						message: "Apply plan?"
+					)
+				}
+            }
+        }
+        stage('Apply') {
+            when {
+                expression {
+                    invokeTerraformPipelineSteps == true &&
+                    planResultStatusCode == 2 && 
+                    invokeApplySteps == true &&
+                    forcePlanOnly == false
+                }
+            }
+            steps{
+                invokeTerraformCommand("terraform apply plan.tfplan", params.DEPLOY_MODULE)
+                // We do not want to include that into the archive artifact
+                invokeTerraformCommand("terraform output -no-color -json > ${WORKSPACE}/output.json", params.DEPLOY_MODULE)
+                            }
+        }
+    }
+    post {
+        success {
+            script {
+                if (fileExists("output.json") || fileExists("changes.yaml") || fileExists(".out/${params.DEPLOY_MODULE}/_generated_code.tf")) {
+                    archiveArtifacts(
+                        artifacts: "output.json,changes.yaml,assessment-results.csv,.out/${params.DEPLOY_MODULE}/_generated_code.tf",
+                        allowEmptyArchive: true,
+                    )
+                }
+            }
+        }
+        always{
+            script {
+                if (fileExists("assessment-results.csv")) {
+                    archiveArtifacts(
+                        artifacts: 'assessment-results.csv',
+                        allowEmptyArchive: true,
+                    )
+                }
+
+                if (params.TF_COMMAND == "apply" || params.TF_COMMAND == "destroy") {
+                    backend_bucket = getBackendBucket(
+                        params.TF_NEXUS_REPO,
+                        params.SDLC_ENV,
+                        env.BUSSEG,
+                        params.DEPLOY_MODULE,
+                        aws_account_id,
+                        env.BRCP_PLATFORM_VERSION.toInteger()
+                    )
+                    
+                    if(params.DEPLOY_MODULE == "security_groups") {
+                        backend_key = getBackendKey(
+                            params.TF_NEXUS_REPO,
+                            params.SDLC_ENV,
+                            env.BUSSEG,
+                            "security_groups_aws",
+                            env.PRODUCT,
+                            params.ENV_ALIAS,
+                            env.BRCP_PLATFORM_VERSION.toInteger()
+                        )
+                    } else {
+                        backend_key = getBackendKey(
+                            params.TF_NEXUS_REPO,
+                            params.SDLC_ENV,
+                            env.BUSSEG,
+                            params.DEPLOY_MODULE,
+                            env.PRODUCT,
+                            params.ENV_ALIAS,
+                            env.BRCP_PLATFORM_VERSION.toInteger()
+                        )
+                    }
+
+                    record(
+                        "recording/${env.JOB_NAME}/${env.BUILD_NUMBER}/${params.TF_ARTIFACT}",
+                        String.valueOf(params.TF_ARTIFACT),
+                        String.valueOf(params.DEPLOY_MODULE),
+                        String.valueOf(env.WORKSPACE),
+                        String.valueOf(env.AWS_CONFIG_FILE),
+                        String.valueOf(env.JOB_URL),
+                        String.valueOf(env.BUILD_URL),
+                        String.valueOf(env.BUILD_NUMBER),
+                        String.valueOf(env.BUILD_TAG),
+                        String.valueOf(env.NODE_NAME),
+                        String.valueOf(params.TF_COMMAND),
+                        Boolean.valueOf(params.REQUIRE_APPROVAL),
+                        String.valueOf(params.TF_TARGET),
+                        String.valueOf(params.SDLC_ENV),
+                        String.valueOf(params.ENV_ALIAS),
+                        String.valueOf(currentBuild.currentResult),
+                        "git@git.devops.broadridge.net:TERRAFORM/ics-otx/ics-otx-tf12.git",
+                        currentBuild.getStartTimeInMillis().toString(),
+                        String.valueOf(aws_account_id),
+                        "s3://${backend_bucket}/${backend_key}",
+                        "nexus://${params.TF_NEXUS_REPO}/${params.TF_ARTIFACT}",
+                        "5fbff717-cf54-4eac-9c02-a9af4ab08723"
+                    )
+
+                }
+            }
+        }
+    }
+}
+
+def getTerraformVersion(String deploy_module, String default_version) {
+    if (fileExists(".out/${deploy_module}/.terraform-version")) {
+        version = readFile ".out/${deploy_module}/.terraform-version"
+    } else if (fileExists(".out/.terraform-version")) {
+        version = readFile ".out/.terraform-version"
+    } else {
+        version = default_version
+    }
+    return [
+        "major": version.split("\\.")[0].toInteger(),
+        "minor": version.split("\\.")[1].toInteger(),
+        "patch": version.split("\\.")[2].toInteger(),
+    ]
+}
+
+def getStartingPointVersion() {
+    if (fileExists('.out/_internal/VERSION')) {
+        return readFile('.out/_internal/VERSION').replaceAll("[\n\r]", "").trim()
+    } else {
+        return "0.0.0"
+    }
+}
+
+def getArtifactVersion() {
+    if (fileExists('.out/VERSION')) {
+        return readFile('.out/VERSION').replaceAll("[\n\r]", "").trim()
+    } else {
+        return "0.0.0"
+    }    
+}
+
+def getBackendRegion(String deploy_module) {
+    switch(deploy_module) {
+        case "iam-prereqs":
+            return "us-east-1"
+            break
+        case "global":
+            return "us-east-1"
+            break
+        case "us-east-1":
+            return "us-east-1"
+            break
+        case "us-west-2":
+            return "us-west-2"
+            break
+        default:
+            return "us-east-1"
+            break
+    }
+}
+
+def getAccountEnvironment(String sdlc = 'dev') {
+    switch(sdlc) {
+        case "sbx":
+            return "npd"
+            break
+        case "dev":
+            return "npd"
+            break
+        case "int":
+            return "npd"
+            break
+        case "qa":
+            return "prd"
+            break
+        case "uat":
+            return "prd"
+            break
+        case "prd":
+            return "prd"
+            break
+        default:
+            echo "[WARNING] unable to identify the account environment, default to NPD"
+            return "npd"
+            break
+    }
+}
+
+def getSDLCEnvironment(String sdlc = 'dev') {
+    switch(sdlc) {
+        case "sbx":
+            return "dev"
+            break
+        case "dev":
+            return "dev"
+            break
+        case "int":
+            return "dev"
+            break
+        case "qa":
+            return "tst"
+            break
+        case "uat":
+            return "tst"
+            break
+        case "prd":
+            return "pro"
+            break
+        default:
+            echo "[WARNING] unable to identify the SDLC Environment, default to DEV"
+            return "dev"
+            break
+    }
+}
+
+def getAWSAccountID(String profile, String cloud_provider) {
+    if (cloud_provider == "aws") {
+        res = sh script: "aws sts get-caller-identity --profile ${profile} --query Account --output text", returnStdout: true
+        return res.trim()
+    }
+    else {
+        return ""
+    }
+}
+
+def copySecurityGroups(String deploy_module, String sdlc) {
+    if (fileExists(".out/${deploy_module}/security_groups/${sdlc}-security_groups.tf")) {
+        echo "[DEBUG] copy SDLC security groups file from subfolder into deploy module"
+        sh "cp .out/${deploy_module}/security_groups/${sdlc}-security_groups.tf .out/${deploy_module}/${sdlc}-security_groups.tf"
+    }
+}
+
+def copyVariables(String deploy_module, String sdlc, String custom_tf_vars) {
+    if (fileExists('.out/variables.tf')) {
+        echo "[DEBUG] copy variables.tf into deploy module folder"
+        sh "cp .out/variables.tf .out/${deploy_module}/variables.tf"
+    } else if (fileExists('.out/variable.tf')) {
+        echo "[DEBUG] copy variable.tf into deploy module folder"
+        sh "cp .out/variable.tf .out/${deploy_module}/variable.tf"
+    } else {
+        echo "[WARN] no variables.tf or variable.tf file exist in root folder"
+    }
+    
+    // Custom variables provided via file in the repository
+    if (fileExists(".out/${sdlc}.tfvars")) {
+        echo "[DEBUG] copy SDLC variables file into deploy module folder"
+        sh "cp .out/${sdlc}.tfvars .out/${deploy_module}/_1_${sdlc}.auto.tfvars"
+    } else {
+        echo "[WARN] SDLC TFVAR file does not exist"
+    }
+
+    // Custom variables provided via file in the repository
+    if (fileExists(".out/${sdlc}_${env_alias}.tfvars")) {
+        echo "[DEBUG] copy ENV Alias SDLC variables file into deploy module folder"
+        sh "cp .out/${sdlc}_${env_alias}.tfvars .out/${deploy_module}/_2_${sdlc}_${env_alias}.auto.tfvars"
+    }
+
+    // Custom variables provided via key=value pair
+    if (custom_tf_vars != "") {
+        echo "[DEBUG] copy job provided variables key/values into deploy module folder"
+        writeFile file: ".out/${deploy_module}/_3_custom.auto.tfvars", text: custom_tf_vars
+    }
+    
+    // Custom variables provided via file
+    if (fileExists("CUSTOM_TF_VARS.tfvars")) {
+        echo "[DEBUG] copy job provided variable file into deploy module folder"
+        sh "cp CUSTOM_TF_VARS.tfvars .out/${deploy_module}/_4_custom.auto.tfvars"
+    }
+
+    // Custom variables provided via upstream job artifact
+    try {
+        currentBuild.getBuildCauses().each { b -> 
+            upstream_job = b.upstreamProject
+        }
+        echo "[INFO] Triggered by upstream job (${upstream_job}), try to download artifacts"
+        copyArtifacts projectName: upstream_job,
+        filter: '*.tfvars',
+        flatten: true,
+        optional: true,
+        selector: upstream(fallbackToLastSuccessful: false),
+        target: 'upstream_artifacts/'
+        // Copy and rename the artifact files to ensure that they are used in the right order
+        sh """
+for f in \$(find upstream_artifacts/*.tfvars -type f); do cp -- "\$f" ".out/${deploy_module}/_4_custom_\$(basename \$f).auto.tfvars"; done
+        """
+    } catch (Exception e) {
+        echo "[INFO] No upstream job, skip download artifact"
+    }    
+}
+
+def getBackendBucket(String nexus_repo, String sdlc, String busseg, String deploy_module, String aws_account_id, Integer platform_version) {
+    account_environment = getAccountEnvironment(sdlc)
+
+    if ("default" == "managed" || deploy_module == "security_groups" || deploy_module == "security_groups_aws") {
+        bucket = "br-ss-${account_environment}-us-east-1-terraform-states"        
+    } else {
+        backend_region = getBackendRegion(deploy_module)
+
+        if (nexus_repo == "CSG" || nexus_repo == "CSG-TEST-DEV") {
+            bucket = "br-ss-${account_environment}-us-east-1-terraform-states"
+        } else {
+            if (platform_version == 1) {
+                bucket = "${aws_account_id}-terraform-states"
+            } else {
+                bucket = "br-${busseg}-${sdlc}-${backend_region}-terraform-states"
+            } 
+        }
+    }
+
+    return bucket
+}
+
+def getBackendKey(String nexus_repo, String sdlc, String busseg, String deploy_module, String product, String env_alias, Integer platform_version) {
+    if ("default" == "managed") {
+        echo "[DEBUG] this project uses managed backend mode"
+        if (env_alias != "") {
+            key = "managed/5fbff717-cf54-4eac-9c02-a9af4ab08723/${product}/${sdlc}/${env_alias}/${deploy_module}.state"
+        } else {
+            key = "managed/5fbff717-cf54-4eac-9c02-a9af4ab08723/${product}/${sdlc}/${deploy_module}.state"
+        }
+    } else {
+        backend_region = getBackendRegion(deploy_module)
+        backend_path = "${product}${env_alias}"
+
+        if (nexus_repo == "CSG" || nexus_repo == "CSG-TEST-DEV" || deploy_module == "security_groups" || deploy_module == "security_groups_aws") {
+            if (getStartingPointVersion() == "0.0.0") {
+                key = "${busseg}/${backend_region}/${sdlc}/${backend_path}/${deploy_module}.state"
+            } else {
+                key = "${busseg}/${sdlc}/${backend_path}/${deploy_module}.state"
+            }
+        } else {
+            if (platform_version == 0) {
+                echo "[DEBUG] this is a 2.1 account, include ${backend_region} into the state key"
+                key = "${busseg}/${backend_region}/${sdlc}/${backend_path}/${deploy_module}.state"
+            } else {
+                echo "[DEBUG] this is a 3.0 account, include ${backend_region} into the state key"
+                key = "${busseg}/${product}/${sdlc}/${backend_path}/${deploy_module}.state"
+            }
+        }
+    }
+    return key
+}
+
+def getBackendConfiguration(String nexus_repo, String sdlc, String busseg, String deploy_module, String product, String env_alias, String aws_account_id, String profile, Integer platform_version) {
+    account_environment = getAccountEnvironment(sdlc)
+    backend_region = getBackendRegion(deploy_module)
+    backend_path = "${product}${env_alias}"
+    terraform_version = getTerraformVersion(deploy_module, "0.12.31")
+    skip_metadata_api_check = (terraform_version.major == 0 && terraform_version.minor <= 12) ? true : false
+
+    if (nexus_repo == "CSG" || nexus_repo == "CSG-TEST-DEV" || deploy_module == "security_groups" || deploy_module == "security_groups_aws" || "default" == "managed") {
+        bucket = getBackendBucket(nexus_repo, sdlc, busseg, deploy_module, aws_account_id, platform_version)
+        key = getBackendKey(nexus_repo, sdlc, busseg, deploy_module, product, env_alias, platform_version)
+        dynamodb_table = "ss-${account_environment}-terraform-state-lock"
+        profile = "ss_${account_environment}"
+        backend_configuration = """
+bucket         = "${bucket}"
+key            = "${key}"
+dynamodb_table = "${dynamodb_table}"
+profile        = "${profile}"
+session_name   = "jenkins"
+skip_metadata_api_check = ${skip_metadata_api_check}
+region         = "us-east-1"
+        """
+    } else {
+        bucket = getBackendBucket(nexus_repo, sdlc, busseg, deploy_module,  aws_account_id, platform_version)
+        key = getBackendKey(nexus_repo, sdlc, busseg, deploy_module, product, env_alias, platform_version)
+        
+        if (platform_version == 0) {
+            region = getBackendRegion(deploy_module)
+            role_arn = "arn:aws:iam::${aws_account_id}:role/BR_DevTerraform_AssumeUser_Role"
+            dynamodb_table = ""
+        } else {
+            region = "us-east-1"
+            role_arn = "arn:aws:iam::${aws_account_id}:role/BR_TerraformAgent_StartingPoint"
+            dynamodb_table = "${aws_account_id}-terraform-state-lock"
+        }
+
+        backend_configuration =  """
+bucket         = "${bucket}"
+key            = "${key}"
+role_arn       = "${role_arn}"
+dynamodb_table = "${dynamodb_table}"
+session_name   = "jenkins"
+skip_metadata_api_check = ${skip_metadata_api_check}
+region         = "${region}"
+        """
+    }
+
+    echo "[DEBUG] terraform backend configuration:"
+    echo backend_configuration
+    return backend_configuration
+}
+
+def getProviderConfiguration(String customTFVars, String deploy_module) {
+    // Initial provider configuration template
+    result = '''
+terraform {
+  required_providers {    
+    aws = {
+      source = "hashicorp/aws"
+      version = "~> 3.66"
+    }
+    dome9 = {
+      source = "terraform.prd.bfsaws.net/next-gen/dome9"
+      version = "1.29.4-brcp"
+    }
+    postgresql = {
+      source = "cyrilgdn/postgresql"
+    }
+  }
+}
+variable "account_profile" {
+  type = string
+}
+
+provider "aws" {
+  region  = var.region
+  profile = var.account_profile
+}
+
+provider "aws" {
+  region  = "us-east-1"
+  profile = var.r53_profile
+  alias   = "dns"
+}
+
+provider "aws" {
+  region  = "us-east-1"
+  profile = var.r53_profile
+  alias   = "dns_us-east-1"
+}
+
+provider "aws" {
+  max_retries = 20
+  region      = "us-west-2"
+  profile     = var.r53_profile
+  alias       = "dns_us-west-2"
+}
+
+provider "aws" {
+  max_retries = 20
+  region      = "us-east-1"
+  profile     = var.account_profile
+  alias       = "global"
+}
+
+provider "aws" {
+  region  = "ap-northeast-1"
+  profile = var.account_profile
+  alias   = "ap-northeast-1"
+}
+
+provider "aws" {
+  region  = "ap-northeast-2"
+  profile = var.account_profile
+  alias   = "ap-northeast-2"
+}
+
+provider "aws" {
+  region  = "ap-northeast-3"
+  profile = var.account_profile
+  alias   = "ap-northeast-3"
+}
+
+provider "aws" {
+  region  = "ap-south-1"
+  profile = var.account_profile
+  alias   = "ap-south-1"
+}
+
+provider "aws" {
+  region  = "ap-southeast-1"
+  profile = var.account_profile
+  alias   = "ap-southeast-1"
+}
+
+provider "aws" {
+  region  = "ap-southeast-2"
+  profile = var.account_profile
+  alias   = "ap-southeast-2"
+}
+
+provider "aws" {
+  region  = "eu-central-1"
+  profile = var.account_profile
+  alias   = "eu-central-1"
+}
+
+provider "aws" {
+  region  = "ca-central-1"
+  profile = var.account_profile
+  alias   = "ca-central-1"
+}
+
+provider "aws" {
+  region  = "eu-north-1"
+  profile = var.account_profile
+  alias   = "eu-north-1"
+}
+
+provider "aws" {
+  region  = "eu-west-1"
+  profile = var.account_profile
+  alias   = "eu-west-1"
+}
+
+provider "aws" {
+  region  = "eu-west-2"
+  profile = var.account_profile
+  alias   = "eu-west-2"
+}
+
+provider "aws" {
+  region  = "eu-west-3"
+  profile = var.account_profile
+  alias   = "eu-west-3"
+}
+
+provider "aws" {
+  region  = "sa-east-1"
+  profile = var.account_profile
+  alias   = "sa-east-1"
+}
+
+provider "aws" {
+  region  = "us-east-1"
+  profile = var.account_profile
+  alias   = "us-east-1"
+}
+
+provider "aws" {
+  region  = "us-east-2"
+  profile = var.account_profile
+  alias   = "us-east-2"
+}
+
+provider "aws" {
+  region  = "us-west-1"
+  profile = var.account_profile
+  alias   = "us-west-1"
+}
+
+provider "aws" {
+  region  = "us-west-2"
+  profile = var.account_profile
+  alias   = "us-west-2"
+}
+
+provider "aws" {
+  region  = "ap-east-1"
+  profile = var.account_profile
+  alias   = "ap-east-1"
+}
+
+provider "aws" {
+  region  = "ca-west-1"
+  profile = var.account_profile
+  alias   = "ca-west-1"
+}
+
+data "aws_ssm_parameter" "platform_access_id" {
+  provider        = aws.dns
+  name            = "/brcp/cfa/integration/dome9/access_id"
+  with_decryption = true
+}
+
+data "aws_ssm_parameter" "platform_secret_key" {
+  provider        = aws.dns
+  name            = "/brcp/cfa/integration/dome9/secret_key"
+  with_decryption = true
+}
+
+provider "dome9" {
+  dome9_access_id  = data.aws_ssm_parameter.platform_access_id.value
+  dome9_secret_key = data.aws_ssm_parameter.platform_secret_key.value
+}
+    '''
+
+    // Parse override values from custom Terraform variables
+    overrideValues = parseOverrides(customTFVars)
+    
+    // Enforce a specific AWS provider version for security_groups module
+    if (deploy_module == "security_groups" || deploy_module == "security_groups_aws") {
+        echo "[DEBUG] Enforce specific AWS provider version to support security groups as code"
+        result = result.replace("~> 3.66", "5.32.0")
+    } else if (deploy_module == "waf_acls") {
+        // Enforce a specific AWS provider version for waf_acls module
+        echo "[DEBUG] Enforce specific AWS provider version to support waf acls as code"
+        result = result.replace("~> 3.66", "3.76.1")
+    } else {
+        // Check and apply override for AWS provider version
+        if (overrideValues.providerOverride) {
+            echo "[DEBUG] Updating aws provider version in provider.tf with the given override value: " + overrideValues.providerOverride
+            result = result.replace("~> 3.66", overrideValues.providerOverride)
+        }
+    }
+
+    return result
+}
+
+def setAzureSubscriptionId(String sdlc) {
+    switch(sdlc) {
+        case "sbx":
+        case "dev":
+        case "int":
+            env.AZURE_SUBSCRIPTION_ID = env.AZURE_DEV_SUBSCRIPTION_ID
+            break
+        case "qa":
+        case "uat":
+            env.AZURE_SUBSCRIPTION_ID = env.AZURE_TST_SUBSCRIPTION_ID
+            break
+        case "prd":
+            env.AZURE_SUBSCRIPTION_ID = env.AZURE_PRD_SUBSCRIPTION_ID
+            break
+        default:
+            echo "[WARNING] unable to identify the account environment, default to empty"
+            env.AZURE_SUBSCRIPTION_ID = ""
+            break
+    }
+}
+
+def getAzureCredentialsId(String sdlc) {
+    switch(sdlc) {
+        case "sbx":
+        case "dev":
+        case "int":
+            return "azure-dev-credentials"
+            break
+        case "qa":
+        case "uat":
+            return "azure-tst-credentials"
+            break
+        case "prd":
+            return "azure-prd-credentials"
+            break
+        default:
+            echo "[WARNING] unable to identify the SDLC Environment."
+            error("Unable to identify SDLC Environment. Cannot proceed with deployment")
+            break
+    }
+}
+
+// This defines all platform variables which could be overriden by app teams tfvar files
+def getDefaultPlatformVariables(String product) {
+    platform_variables = """
+product="${product}"
+    """
+    echo "[DEBUG] default platform generated variables. these variables can be overriden using any .tfvars method."
+    echo platform_variables
+    return platform_variables
+}
+
+// This defines all platform variables which should NOT be overriden by app teams tfvar files
+def getPlatformVariables(String sdlc, String busseg, String short_name, String env_alias, String account_prefix, Integer platform_version) {
+    platform_variables = ""
+
+    if (getStartingPointVersion() == "0.0.0") {
+        iam_role_prefix = "ADFS-BR_${busseg.toUpperCase()}_${sdlc.toUpperCase()}"
+    } else {
+        if (platform_version == 1) {
+            iam_role_prefix = "ADFS-BR_${short_name.toUpperCase()}_${sdlc.toUpperCase()}"
+        } else {
+            iam_role_prefix = "ADFS-BR_${busseg.toUpperCase()}_${sdlc.toUpperCase()}"
+        }
+    }
+
+    platform_variables = """
+starting_point_version="${getStartingPointVersion()}"
+terraform_artifact_version="${getArtifactVersion()}"
+r53_vpc_us_east_1="${getRoute53Configuration(sdlc)["TF_VAR_r53_vpc_us_east_1"]}"
+r53_vpc_us_west_2="${getRoute53Configuration(sdlc)["TF_VAR_r53_vpc_us_west_2"]}"
+r53_profile="${getRoute53Configuration(sdlc)["TF_VAR_r53_profile"]}"
+account_prefix="${account_prefix}"
+accountenv="${getAccountEnvironment(sdlc)}"
+account_profile="${TF_PROFILE}"
+busseg="${busseg}"
+sdlcenv="${sdlc}"
+env_alias="${env_alias}"
+iamroleprefix="${iam_role_prefix}"
+segment="LEGACY VARIABLE SEGMENT"
+sbu="ics"
+dept="710"
+accountcode="5677"
+owner="Anil.Derebail@broadridge.com"
+serverrole="LEGACY VARIABLE SERVERROLE"
+project="otx"
+technology="2160"
+chargecode="CCCAL-5677-710-01016-000-XCAWSOTX"
+bladelogic_passwd="LEGACY VARIABLE BLADELOGIC_PASSWD"
+nexus_server_url="${env.NEXUS_SERVER_URL}"
+chef_server_url="${env.CHEF_SERVER_URL}"
+    """
+
+    if (getStartingPointVersion() == "0.0.0") {
+        echo "[DEBUG] additional platform variables have been added to ensure SP 2.x compatibility"
+        platform_variables = platform_variables + """
+# SP 2.0 compatibility
+r53_vpc_id="${getRoute53Configuration(sdlc)["TF_VAR_r53_vpc_us_east_1"]}"
+r53_vpc_secondary_id="${getRoute53Configuration(sdlc)["TF_VAR_r53_vpc_us_west_2"]}"
+region="${getBackendRegion(deploy_module)}"
+        """
+    }
+   
+    echo "[DEBUG] mandatory platform generated variables"
+    echo platform_variables
+    return platform_variables
+}
+
+def getAzurePlatformVariables(String subscription_id, String client_id, String client_secret, String ss_client_id, String ss_client_secret, String tenant_id, String ss_subscription_id) {
+    azure_platform_variables = """
+azure_client_id="${client_id}"
+azure_subscription_id="${subscription_id}"
+azure_tenant_id="${tenant_id}"
+azure_ss_client_id="${ss_client_id}"
+azure_ss_subscription_id="${ss_subscription_id}"
+    """
+    echo "[DEBUG] mandatory azure platform generated variables. Some other variables are not shown as they contain secret information"
+    echo azure_platform_variables
+
+    //Don't print these details in console and hence seperated from others
+    azure_platform_variables = azure_platform_variables + """
+azure_ss_client_secret="${ss_client_secret}"
+azure_client_secret="${client_secret}"
+    """
+
+    return azure_platform_variables
+}
+
+def getRoute53Configuration(String sdlc) {
+    account_environment = getAccountEnvironment(sdlc)
+    switch(account_environment) {
+        case "npd":
+            return [
+                "TF_VAR_r53_vpc_us_east_1": "vpc-42b5e024",
+                "TF_VAR_r53_vpc_us_west_2": "vpc-383c6f41",
+                "TF_VAR_r53_profile": "ss_npd"
+            ]
+            break
+        case "prd":
+            return [
+                "TF_VAR_r53_vpc_us_east_1": "vpc-cc5472aa",
+                "TF_VAR_r53_vpc_us_west_2": "vpc-ef226996",
+                "TF_VAR_r53_profile": "ss_prd"
+            ]
+            break
+    }
+}
+
+def invokeTerraformCommand(String command, String deploy_module) {
+    dir(".out/${deploy_module}") {
+        status = sh(
+            script: "${command}",
+            returnStatus: true
+        ).toInteger()
+        if (status == 1) {
+            currentBuild.result = "FAILURE"
+        } else {
+            return status
+        }
+    }
+}
+
+def invokeCheckov(String deploy_module) {
+    try {
+        sh "docker run --rm -t -v ${WORKSPACE}/.out/${deploy_module}:/terraform artifacts.devops.bfsaws.net/docker/tss-genericimages/br_tss_checkov:0.8.18 checkov --config /home/brcp_terraform_scan_policies/configs/tfplan-config.yml --quiet --compact"
+    } catch (Exception e) {
+        echo "[WARN] An unexpected error occured while running Checkov. Please report this issue to CSG using Jira Service Desk and reference a link to this pipeline."
+    }
+}
+
+
+def getPlanSummary(String deploy_module) {
+    return sh(
+        script: "docker run --rm -t -v ${WORKSPACE}/.out/${deploy_module}:/terraform ecr.npd.bfsaws.net/cfa-nightwatch:0.4.1 cfa-nightwatch summarize -p /terraform/plan.json",
+        returnStdout: true
+    )
+}
+
+def renderSecurityGroupsDome9(String account_prefix, String job_name, String sdlc, String workspace, String aws_config_file, String aws_account_id, String env_alias) {
+    echo "[INFO] this is a generated deploy module. All unwanted files will be removed to ensure integrity"
+    sh "rm -rf ${workspace}/.out/security_groups"
+    sh "mkdir -p ${workspace}/.out/security_groups"
+    sh """
+docker run --rm -t --user \$(id -u \${USER}):\$(id -g \${USER}) \
+--env "ACCOUNT_PREFIX=${account_prefix}" \
+--env "JOB_NAME=${job_name}" \
+--env "SDLC_ENV=${sdlc}" \
+--env "AWS_SDK_LOAD_CONFIG=1" \
+--env "AWS_CONFIG_FILE=/tmp/sp_config" \
+--env "AWS_ACCOUNT_ID=${aws_account_id}" \
+--env "ENV_ALIAS=${env_alias}" \
+--env "LOG_LEVEL=debug" \
+--env "AWS_DEFAULT_REGION=us-east-1" \
+-v ${workspace}/.out:/terraform \
+-v ${aws_config_file}:/tmp/sp_config \
+-w /terraform/ \
+ecr.npd.bfsaws.net/brcp-sac-cli:3.0.10-beta make -f /plato/Makefile render_dome9_security_groups
+    """
+}
+
+def renderSecurityGroupsAWS(String account_prefix, String job_name, String sdlc, String workspace, String aws_config_file, String aws_account_id, String env_alias, Boolean add_unapproved_tags) {
+    echo "[INFO] this is a generated deploy module. All unwanted files will be removed to ensure integrity"
+    sh "rm -rf ${workspace}/.out/security_groups/.terraform"
+    sh "rm -f ${workspace}/.out/security_groups/.terraform.lock.hcl"
+    sh "rm -f ${workspace}/.out/security_groups/dome9.tf"
+    sh """
+docker run --rm -t --user \$(id -u \${USER}):\$(id -g \${USER}) \
+--env "ACCOUNT_PREFIX=${account_prefix}" \
+--env "JOB_NAME=${job_name}" \
+--env "SDLC_ENV=${sdlc}" \
+--env "AWS_SDK_LOAD_CONFIG=1" \
+--env "AWS_CONFIG_FILE=/tmp/sp_config" \
+--env "AWS_ACCOUNT_ID=${aws_account_id}" \
+--env "ENV_ALIAS=${env_alias}" \
+--env "LOG_LEVEL=debug" \
+--env "ADD_UNAPPROVED_TAGS=${add_unapproved_tags}" \
+--env "AWS_DEFAULT_REGION=us-east-1" \
+-v ${workspace}/.out:/terraform \
+-v ${aws_config_file}:/tmp/sp_config \
+-w /terraform/ \
+ecr.npd.bfsaws.net/brcp-sac-cli:3.0.10-beta make -f /plato/Makefile render_aws_security_groups
+    """
+}
+
+def convertSecurityGroupsStatefile(String account_prefix, String job_name, String sdlc, String workspace, String aws_config_file, String aws_account_id, String env_alias) {
+    sh """
+docker run --rm -t --user \$(id -u \${USER}):\$(id -g \${USER}) \
+--env "ACCOUNT_PREFIX=${account_prefix}" \
+--env "JOB_NAME=${job_name}" \
+--env "SDLC_ENV=${sdlc}" \
+--env "AWS_SDK_LOAD_CONFIG=1" \
+--env "AWS_CONFIG_FILE=/tmp/sp_config" \
+--env "AWS_ACCOUNT_ID=${aws_account_id}" \
+--env "ENV_ALIAS=${env_alias}" \
+--env "LOG_LEVEL=debug" \
+--env "AWS_DEFAULT_REGION=us-east-1" \
+-v ${workspace}/.out:/terraform \
+-v ${aws_config_file}:/tmp/sp_config \
+-w /terraform/ \
+ecr.npd.bfsaws.net/brcp-sac-cli:3.0.10-beta pwsh /sac/converter.ps1
+    """
+}
+
+def renderWafAcls(String account_prefix, String job_name, String sdlc, String workspace, String aws_config_file) {
+    echo "[INFO] this is a generated deploy module. All unwanted files will be removed to ensure integrity"
+    sh "rm -rf waf_acls"
+    sh "mkdir -p waf_acls"
+    sh """
+docker run --rm -t --user \$(id -u \${USER}):\$(id -g \${USER}) \
+--env "ACCOUNT_PREFIX=${account_prefix}" \
+--env "JOB_NAME=${job_name}" \
+--env "SDLC_ENV=${sdlc}" \
+--env "AWS_SDK_LOAD_CONFIG=1" \
+--env "AWS_CONFIG_FILE=/tmp/sp_config" \
+-v ${workspace}/.out:/terraform \
+-v ${aws_config_file}:/tmp/sp_config \
+-w /terraform/ \
+ecr.npd.bfsaws.net/brcp-waf-cli:2.0.1 make -f /plato/Makefile render_waf_acls
+    """
+}
+
+
+def record(
+        String key,
+        String artifact_name,
+        String deploy_module,
+        String workspace,
+        String aws_config_file,
+        String job_url,
+        String build_url,
+        String build_number,
+        String build_tag,
+        String node_name,
+        String command,
+        Boolean approval,
+        String target,
+        String sdlc,
+        String env_alias,
+        String result,
+        String repository_url,
+        String start_time,
+        String aws_account_id,
+        String backend_path,
+        String origin_artifact_url,
+        String application_id
+        ) {
+    dir(".out") {
+        // Recording is currently only supported in DEV deployments
+        if (sdlc in ["sbx", "dev", "int"]) {
+            bucket = "875955403647-terraform-states"
+            dynamodb_table = "br-csgssdev-csgportal-startingpoint-recording"
+            aws_profile = "bfs21_tss_csgss_dev"
+        } else {
+            bucket = "487162726417-terraform-states"
+            dynamodb_table = "br-csgssprd-csgportal-startingpoint-recording"
+            aws_profile = "bfs21_tss_csgss_pro"
+        }
+        sh """
+mkdir .post_deploy
+tar -cpf .post_deploy/${artifact_name} --exclude ".post_deploy" --exclude ".terraform" .
+
+docker run --rm -t \
+--env "AWS_SDK_LOAD_CONFIG=1" \
+--env "AWS_CONFIG_FILE=/root/.aws/sp_config" \
+--env "AWS_PROFILE=${aws_profile}" \
+--env "AWS_REGION=us-east-1" \
+-v ${workspace}/.out:/terraform \
+-v /home/terraformer/.aws:/root/.aws \
+ecr.npd.bfsaws.net/cfa-nightwatch:0.4.1 \
+cfa-nightwatch record \
+--bucket ${bucket} \
+--key "${key}" \
+--dynamodb-table ${dynamodb_table} \
+--artifact "/terraform/.post_deploy/${artifact_name}" \
+--plan "/terraform/${deploy_module}/plan.json" \
+--job-url "${job_url}" \
+--build-url "${build_url}" \
+--build-number "${build_number}" \
+--build-tag "${build_tag}" \
+--node-name "${node_name}" \
+--command "${command}" \
+--approval "${approval}" \
+--target "${target}" \
+--sdlc "${sdlc}" \
+--deploy-module "${deploy_module}" \
+--env-alias "${env_alias}" \
+--result "${result}" \
+--repository-url "${repository_url}" \
+--start-time "${start_time}" \
+--account-id "${aws_account_id}" \
+--origin-artifact-url "${origin_artifact_url}" \
+--variables-folder "/terraform/${deploy_module}/" \
+--application-id "${application_id}"
+
+        """
+    }
+}
+
+def prepareDockerEnvironment() {
+    sh """
+set +x
+docker pull artifacts.devops.bfsaws.net/docker/tss-genericimages/br_tss_checkov:0.8.18
+docker pull ecr.npd.bfsaws.net/brcp-sac-cli:2.0.0
+docker pull ecr.npd.bfsaws.net/brcp-sac-cli:3.0.10-beta
+docker pull ecr.npd.bfsaws.net/cfa-nightwatch:0.2.4
+docker pull ecr.npd.bfsaws.net/cfa-nightwatch:0.3.0
+docker pull ecr.npd.bfsaws.net/cfa-nightwatch:0.4.0
+docker pull ecr.npd.bfsaws.net/cfa-nightwatch:0.4.1
+set -x
+    """
+}
+
+def checkApproved() {
+    return sh(
+        script: "docker run --rm -t -v ${WORKSPACE}/.out/${deploy_module}:/terraform ecr.npd.bfsaws.net/cfa-nightwatch:0.4.1 cfa-nightwatch validate -p /terraform/plan.json -a /terraform/approved_changes.yaml",
+        returnStatus: true
+    ).toInteger()
+}
+
+def runAssessment(String accountId, String dome9_access_id, String dome9_secret_key) {
+    echo "[INFO] Running a Dome9 assessment. This could take up to 5 minutes. You can keep this this job running and continue with any other action while you wait for completion."
+    echo ""
+    return sh(
+        script: "docker run --rm -t --env DOME9_ACCESS_ID=${dome9_access_id} --env DOME9_SECRET_KEY=${dome9_secret_key} -v ${WORKSPACE}:/terraform ecr.npd.bfsaws.net/cfa-nightwatch:0.4.1 cfa-nightwatch run-assessment -a ${accountId} -b -5 -o /terraform/assessment-results.csv",
+        returnStatus: true
+    ).toInteger()
+}
+
+def setBuildDescription(String action) {
+    if (params.ENV_ALIAS && params.ENV_ALIAS != "") {
+        currentBuild.description = "${action}|${params.SDLC_ENV}|${params.DEPLOY_MODULE}|${params.ENV_ALIAS}"
+    } else {
+        currentBuild.description = "${action}|${params.SDLC_ENV}|${params.DEPLOY_MODULE}"
+    }
+}
+
+def unlockState (String nexus_repo, String sdlc, String busseg, String deploy_module, String product, String env_alias, String aws_account_id, Integer platform_version) {
+    echo "[INFO] Removing state file lock ..."
+    
+    // Initialize these variables for the shared-services values because that's the scenario in which users would really need to use the pipeline
+    account_environment = getAccountEnvironment(sdlc)
+    bucket = getBackendBucket(nexus_repo, sdlc, busseg, deploy_module, aws_account_id, platform_version)
+    table_name = "ss-${account_environment}-terraform-state-lock"
+    key = getBackendKey(nexus_repo, sdlc, busseg, deploy_module, product, env_alias, platform_version)
+    profile = "ss_${account_environment}"
+    
+    // If a user wants to use this for DEV (byo-repo) instead of just deleting from their account manually, we can override the defaults below
+    if (nexus_repo != "CSG" && nexus_repo != "CSG-TEST-DEV" && "default" != "managed") {
+        if (platform_version == 0) {
+            echo "[INFO] 2.1 Accounts do not lock the state for dev-byo-repo deploys, so there's nothing to do!"
+            return
+        } else {
+            table_name = "${aws_account_id}-terraform-state-lock"
+            profile = "${env.TF_PROFILE}"
+        }
+    }
+
+    result = sh(script: "aws dynamodb delete-item --table-name ${table_name} --key '{\"LockID\": {\"S\": \"${bucket}/${key}-md5\"}}' --profile ${profile}", returnStatus: true).toInteger()
+    
+    // Every once in a while, you get a weird situation where we have a lock entry that has no -md5 suffix. We should also try to remove that entry if it exists
+    result_other = sh(script: "aws dynamodb delete-item --table-name ${table_name} --key '{\"LockID\": {\"S\": \"${bucket}/${key}\"}}' --profile ${profile}", returnStatus: true).toInteger()
+
+    // As long as one of the commands above returns 0, we can consider this a success. This should only fail if both fail and return non-zero results
+    return result * result_other
+}
+
+def parseOverrides (String customTFVars) {
+    def providerOverrideMatch = customTFVars =~ /OVERRIDE_AWS_PROVIDER_VERSION\s*=\s*"(.*)"/   
+    def providerOverride = ""
+    if (providerOverrideMatch){
+       providerOverride = providerOverrideMatch.group(1)
+       //echo "[DEBUG] Provider override found: " + providerOverride
+    }
+
+    def productOverrideMatch = customTFVars =~ /OVERRIDE_PRODUCT\s*=\s*"(.*)"/
+    def productOverride = ""
+    if (productOverrideMatch){
+       productOverride = productOverrideMatch.group(1)
+       //echo "[DEBUG] Product override found: " + productOverride
+    }
+
+    return [
+        "productOverride": "${productOverride}",
+        "providerOverride": "${providerOverride}"
+    ]
+}
+
+def checkSecurityGroups(String sdlc) {
+    echo "[INFO] Validate your Security Groups as Code configuration..."
+    result = sh(
+        script: """
+            docker run --rm -t --user \$(id -u \${USER}):\$(id -g \${USER}) \
+            --env INVENTORY_API_TOKEN=${INVENTORY_API_TOKEN} \
+            --env CMDB_USERNAME=${CMDB_USERNAME} \
+            --env CMDB_PASSWORD=${CMDB_PASSWORD} \
+            -v ${WORKSPACE}/.out:/terraform -w /terraform/ \
+            artifacts.devops.bfsaws.net/corp-bisg-docker/corp-bisg-public/br_corp_sgac_checkr:0.4.2 \
+            sgac-checkr --sdlc ${sdlc} /terraform/security_groups.csv
+        """,
+        returnStdout: true
+    )
+    echo "[INFO] Write Security Groups as Code Test Results to File"
+    writeFile file: "${WORKSPACE}/security_groups.xml", text: result
+    junit testResults: "security_groups.xml"
+}
+
+
+def throwNonCompliantSecurityGroupsError() {
+    error("""
+#######################################################################################################################################
+#######################################################################################################################################
+## This is an experimental feature. Users may encounter instances where rules that are valid from their perspective fail validation. ##
+## In such cases, please initiate a regular merge request detailing your security group requirements and discuss these requirements  ##
+## with a BISG associate via the merge request. This interaction will also aid in optimizing the automatic validation process,       ##
+## helping to minimize false positive errors.                                                                                        ##
+#######################################################################################################################################
+#######################################################################################################################################
+
+Build failed because of non-compliant security groups, please review the test results attached to the Jenkins Job.
+
+You can review the test results at: ${BUILD_URL}testReport/
+""")
+}
